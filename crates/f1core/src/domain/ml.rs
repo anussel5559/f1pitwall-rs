@@ -11,6 +11,8 @@ use ort::session::Session;
 #[cfg(feature = "ml")]
 use std::sync::Mutex;
 
+#[cfg(feature = "ml")]
+use super::strategy::Confidence;
 use super::strategy::MlPitPrediction;
 
 /// Number of input features (must match Python training pipeline).
