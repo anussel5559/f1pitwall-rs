@@ -1,0 +1,32 @@
+[package]
+name = "f1core"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bulk-import"
+path = "src/bin/bulk_import.rs"
+
+[features]
+default = []
+ml = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+ort = { version = "2.0.0-rc.12", optional = true }
+ndarray = { version = "0.17", optional = true }
+tokio.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+ts-rs.workspace = true
+dirs = "6"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+rumqttc = { version = "0.24", features = ["use-rustls"] }
+rustls = "0.22"
+rustls-native-certs = "0.7"
+include_dir = "0.7"
+tracing.workspace = true
