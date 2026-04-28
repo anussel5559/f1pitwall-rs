@@ -1,4 +1,5 @@
 mod app;
+mod bootstrap;
 mod pages;
 mod session_types;
 mod ui;
@@ -15,6 +16,20 @@ use ratatui::prelude::*;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// pw runs a chunked replay bootstrap that can interleave with picker / session
+/// fetches, so it picks rate-limit values a bit below the core defaults to leave
+/// extra headroom under OpenF1's public 30 req/min cap. Authenticated callers
+/// also get a small step-down so a noisy bootstrap doesn't 429 the live board.
+async fn build_client(credentials: Option<auth::Credentials>) -> Result<api::OpenF1Client> {
+    let (max_req, min_interval) = if credentials.is_some() {
+        (50, Duration::from_millis(220))
+    } else {
+        (24, Duration::from_millis(500))
+    };
+    api::OpenF1Client::with_rate_limit(credentials, max_req, min_interval).await
+}
 
 #[derive(Parser)]
 #[command(name = "pw", about = "Live F1 timing board in the terminal")]
@@ -69,7 +84,7 @@ async fn main() -> Result<()> {
 
     let database = db::Db::open(&args.db)?;
     let db = Arc::new(Mutex::new(database));
-    let client = Arc::new(api::OpenF1Client::new(credentials).await?);
+    let client = Arc::new(build_client(credentials).await?);
 
     // Setup terminal
     enable_raw_mode()?;
@@ -106,10 +121,10 @@ async fn run_picker_loop(
                 pages::session::run(terminal, session_key, speed, &client, db).await?;
             }
             pages::picker::PickerAction::Login(creds) => {
-                client = Arc::new(api::OpenF1Client::new(Some(creds)).await?);
+                client = Arc::new(build_client(Some(creds)).await?);
             }
             pages::picker::PickerAction::Logout => {
-                client = Arc::new(api::OpenF1Client::new(None).await?);
+                client = Arc::new(build_client(None).await?);
             }
         }
     }

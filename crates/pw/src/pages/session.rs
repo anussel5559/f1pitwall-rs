@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::input::{LocationTask, TelemetryTask, handle_input};
-use crate::{app, session_types::SessionType, ui};
+use crate::{app, bootstrap, session_types::SessionType, ui};
 use app::{AppState, SessionClock, ViewMode};
 use f1core::{api, db, polling};
 
@@ -40,6 +40,7 @@ pub async fn run(
     let is_live = s.date_end.is_none();
     let clock = SessionClock::new(date_start, speed, gmt_offset.as_deref(), is_live);
     let toasts: app::Toasts = Arc::new(Mutex::new(Vec::new()));
+    let bootstrap_status = bootstrap::new_status();
 
     // Auto-resume from saved position if available
     if !clock.is_live
@@ -81,18 +82,36 @@ pub async fn run(
         .await;
     });
 
-    // For replays, kick off the per-driver car_data + location bootstrap
+    // For replays, kick off the chunked per-driver car_data + location bootstrap
     // (idempotent via completeness check) so map/telemetry can serve from DB.
+    // The bootstrap reads the drivers list from the DB on entry, so we wait for
+    // `run_polling`'s session-type bootstrap (above) to populate it first —
+    // otherwise the empty-drivers early return makes the whole thing a no-op
+    // and the session never accumulates car_data / location.
     if !clock.is_live {
         let bootstrap_db = db.clone();
         let bootstrap_client = client.clone();
         let bootstrap_toasts = toasts.clone();
+        let bootstrap_status = bootstrap_status.clone();
         tokio::spawn(async move {
-            polling::bootstrap_session_data(
+            for _ in 0..60 {
+                let has_drivers = bootstrap_db
+                    .lock()
+                    .unwrap()
+                    .get_driver_numbers(session_key)
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false);
+                if has_drivers {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            bootstrap::run(
                 session_key,
                 bootstrap_client,
                 bootstrap_db,
                 bootstrap_toasts,
+                bootstrap_status,
             )
             .await;
         });
@@ -100,6 +119,7 @@ pub async fn run(
 
     let authenticated = client.is_authenticated().await;
     let mut state = AppState::new(session_key, session_type, toasts, clock, authenticated);
+    state.bootstrap_status = bootstrap_status;
 
     let result = run_event_loop(terminal, &mut state, db, client, session_key);
 

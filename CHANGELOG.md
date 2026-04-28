@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.32.0
+
+- TUI replay bootstrap rewritten in `pw` for fast, all-driver chunked fetches
+  - `crates/pw/src/bootstrap.rs` (new) replaces `polling::bootstrap_session_data` for `pw` only — the f1core function is untouched so the web backend keeps its existing per-driver behavior. Each chunk is a single all-drivers request (no `driver_number` filter, exposed via the new `OpenF1Client::get_car_data_all_drivers` and the existing `get_location` with an empty driver slice). For a 2h race that's ~16 total requests instead of ~176, dropping the bootstrap from ~7 min to under a minute at 24 req/min
+  - Chunks are 15 minutes — empirically the largest window OpenF1 will return all-drivers data for without 422'ing (60min hits the cap, 30min triggers ~2-minute slow downloads), and stays comfortably under the 10s reqwest timeout. Both `date>=` (session start) and `date<=` (chunk end) bounds are always present; requests without a lower bound have been observed to walk back through pre-session samples and either time out or 422
+  - Per-chunk retry with 1s/2s/4s backoff (`fetch_with_retry`) — turns transient `error decoding response body` and 5xx blips into eventually-consistent loads instead of permanent gaps. car_data and location for each chunk fire in parallel via `tokio::join!`, sharing the OpenF1 client's rate limiter
+  - `crates/pw/src/pages/session.rs` waits for `run_polling`'s session-type bootstrap to populate the drivers table before invoking the bootstrap (previously the bootstrap raced ahead and exited via the empty-drivers early return, leaving the session with zero car_data / location accumulating)
+- Bootstrap progress overlay
+  - `crates/pw/src/bootstrap.rs` exposes `Status` (`Arc<Mutex<Option<Progress>>>`) updated chunk-by-chunk; `pages/session.rs` shares one with both the bootstrap task and `AppState`. `crates/pw/src/ui/mod.rs` `render_bootstrap_status` draws a top-right braille spinner + `Loading replay data N/M` overlay on top of every view (board, telemetry, track map). Clears the moment the bootstrap finishes; never appears on live sessions
+- Caller-controlled rate limit on `OpenF1Client`
+  - New additive `OpenF1Client::with_rate_limit(credentials, max_requests_per_minute, min_interval)` in `crates/f1core/src/api/mod.rs`. `new()` delegates to it with the existing 28/55 defaults, so the web backend is unchanged. `crates/pw/src/main.rs` `build_client` calls the new method with conservative values (24/500ms unauth, 50/220ms auth) so a noisy bootstrap can't push the unauthenticated public 30 req/min cap with clock drift
+- Hide cancelled 2026 grand prix weekends from the picker
+  - `crates/pw/src/pages/picker.rs` adds `CANCELLED_MEETING_KEYS = [1282, 1283]` (Bahrain GP 2026, Saudi Arabian GP 2026) and applies the filter in both `filter_future_sessions` and the paused-sessions list at the top of `picker::run`. OpenF1 still serves these meetings, but neither weekend ran. Pre-season Bahrain testing (meeting_key 1304/1305) is unaffected
+
 ## 0.31.1
 
 - Extracted from [anussel5559/f1-pitwall](https://github.com/anussel5559/f1-pitwall) as the open-source slice of the project: `f1core` library + `pw` terminal UI. The pitwall web backend + SvelteKit frontend stay private. Repo is MIT, releases ship `pw` binaries via GitHub Releases + Homebrew tap (`anussel5559/tap`)

@@ -39,8 +39,48 @@ pub fn draw(
         }
     }
 
+    // Render bootstrap-progress spinner as a top-right overlay.
+    render_bootstrap_status(f, state);
+
     // Render toasts as an overlay
     render_toasts(f, state);
+}
+
+/// Braille spinner frames for the replay-bootstrap progress overlay.
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn render_bootstrap_status(f: &mut Frame, state: &AppState) {
+    let Some(progress) = state.bootstrap_progress() else {
+        return;
+    };
+
+    let frame_idx = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        / 100) as usize
+        % SPINNER_FRAMES.len();
+    let spinner = SPINNER_FRAMES[frame_idx];
+    let text = format!(
+        " {} Loading replay data {}/{} ",
+        spinner, progress.completed, progress.total
+    );
+    let text_len = text.chars().count() as u16;
+
+    let area = f.area();
+    let width = text_len.min(area.width);
+    let status_area = Rect {
+        x: area.width.saturating_sub(width),
+        y: 0,
+        width,
+        height: 1,
+    };
+
+    f.render_widget(Clear, status_area);
+    f.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
+        status_area,
+    );
 }
 
 fn draw_race(f: &mut Frame, state: &mut AppState) {
