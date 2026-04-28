@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use f1core::api::OpenF1Client;
-use f1core::util::time::{fmt_ts, parse_ts};
 use f1core::db::Db;
 use f1core::toast::{Toasts, push_toast};
+use f1core::util::time::{fmt_ts, parse_ts};
 
 /// Shared progress state surfaced to the UI as a loading spinner. `None` means
 /// no bootstrap is running (or it's already done); `Some(_)` is rendered as a

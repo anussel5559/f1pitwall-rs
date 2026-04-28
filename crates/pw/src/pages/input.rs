@@ -142,24 +142,10 @@ pub fn handle_input(
                     }
                     KeyCode::Char('q') => return Ok(true),
                     KeyCode::Down | KeyCode::Char('j') => {
-                        switch_telemetry_driver(
-                            state,
-                            telem_task,
-                            db,
-                            session_key,
-                            current_dn,
-                            1,
-                        );
+                        switch_telemetry_driver(state, telem_task, db, session_key, current_dn, 1);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        switch_telemetry_driver(
-                            state,
-                            telem_task,
-                            db,
-                            session_key,
-                            current_dn,
-                            -1,
-                        );
+                        switch_telemetry_driver(state, telem_task, db, session_key, current_dn, -1);
                     }
                     KeyCode::Char('h') => {
                         if let Some(ref shared) = telem_task.shared {
