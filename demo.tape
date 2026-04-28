@@ -12,10 +12,11 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
 
 # --- Session Picker ---
-
-Type "pw --fresh"
-Sleep 500ms
+Hide
+Type "cargo run -p pw -- --fresh"
 Enter
+Sleep 500ms
+Show
 Sleep 4s
 
 # Browse down through sessions
@@ -34,7 +35,7 @@ Right
 Sleep 1s
 
 # Scroll back up to the China race (2nd from top)
-Up
+Down 3
 
 Sleep 500ms
 
@@ -98,7 +99,7 @@ Sleep 300ms
 
 # Open telemetry
 Type "t"
-Sleep 8s
+Sleep 4s
 
 # Scroll back through telemetry history
 Type "h"
@@ -121,6 +122,11 @@ Sleep 8s
 # Close telemetry
 Type "t"
 Sleep 3s
+
+# show map
+Space
+Type "m"
+Sleep 5s
 
 # Quit
 Type "q"

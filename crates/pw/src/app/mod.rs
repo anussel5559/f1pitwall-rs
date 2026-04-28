@@ -36,6 +36,9 @@ pub struct AppState {
     pub toasts: Toasts,
     pub clock: Arc<SessionClock>,
     pub authenticated: bool,
+    /// Replay-bootstrap progress for the spinner overlay; `None` when nothing
+    /// is in progress (live sessions, completed bootstrap, etc.).
+    pub bootstrap_status: crate::bootstrap::Status,
 }
 
 impl AppState {
@@ -78,7 +81,13 @@ impl AppState {
             toasts,
             clock,
             authenticated,
+            bootstrap_status: crate::bootstrap::new_status(),
         }
+    }
+
+    /// Snapshot of the current bootstrap progress, if a bootstrap is running.
+    pub fn bootstrap_progress(&self) -> Option<crate::bootstrap::Progress> {
+        *self.bootstrap_status.lock().unwrap()
     }
 
     /// Get active toasts (less than 15 seconds old), pruning expired ones.

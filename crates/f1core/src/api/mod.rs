@@ -69,15 +69,27 @@ impl RateLimiter {
 
 impl OpenF1Client {
     pub async fn new(credentials: Option<Credentials>) -> Result<Self> {
-        let auth = match credentials {
-            Some(creds) => Some(AuthManager::new(creds).await?),
-            None => None,
-        };
-
-        let (max_req, min_interval) = if auth.is_some() {
+        let (max_req, min_interval) = if credentials.is_some() {
             (55, Duration::from_millis(200)) // authenticated: 55 req/min with headroom
         } else {
             (28, Duration::from_millis(400)) // public: 28 req/min
+        };
+        Self::with_rate_limit(credentials, max_req, min_interval).await
+    }
+
+    /// Build a client with a caller-supplied per-minute request cap and minimum
+    /// inter-request interval. Useful when a caller wants more headroom than the
+    /// defaults — e.g. `pw`'s replay bootstrap, which interleaves with picker /
+    /// session-info requests and benefits from staying further below the public
+    /// 30 req/min cap so transient clock drift doesn't trigger 429s.
+    pub async fn with_rate_limit(
+        credentials: Option<Credentials>,
+        max_requests_per_minute: usize,
+        min_interval: Duration,
+    ) -> Result<Self> {
+        let auth = match credentials {
+            Some(creds) => Some(AuthManager::new(creds).await?),
+            None => None,
         };
 
         Ok(Self {
@@ -86,7 +98,7 @@ impl OpenF1Client {
                 .build()
                 .expect("failed to build HTTP client"),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
-                max_req,
+                max_requests_per_minute,
                 Duration::from_secs(60),
                 min_interval,
             ))),
@@ -293,6 +305,26 @@ impl OpenF1Client {
         }
         if let Some(d) = date_gt {
             params.push(("date>", d));
+        }
+        if let Some(d) = date_lte {
+            params.push(("date<=", d));
+        }
+        self.get("/car_data", &params).await
+    }
+
+    /// Fetch car_data for every driver in one request (no `driver_number` filter).
+    /// OpenF1 imposes a "too much data" cap on the time range, so callers must
+    /// chunk to roughly 15 minutes or less; outside that, the API returns 422.
+    pub async fn get_car_data_all_drivers(
+        &self,
+        session_key: i64,
+        date_gte: Option<&str>,
+        date_lte: Option<&str>,
+    ) -> Result<Vec<CarData>> {
+        let sk = session_key.to_string();
+        let mut params = vec![("session_key", sk.as_str())];
+        if let Some(d) = date_gte {
+            params.push(("date>=", d));
         }
         if let Some(d) = date_lte {
             params.push(("date<=", d));

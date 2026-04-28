@@ -10,6 +10,15 @@ use crate::{session_types::SessionType, ui};
 use f1core::{api, db};
 use ui::picker::PickerState;
 
+/// OpenF1 still serves these grand prix weekends, but they were cancelled and never ran —
+/// hide them so the user doesn't try to open a session that has nothing behind it.
+/// Bahrain GP 2026 (1282), Saudi Arabian GP 2026 (1283).
+const CANCELLED_MEETING_KEYS: &[i64] = &[1282, 1283];
+
+fn is_cancelled(entry: &db::SessionEntry) -> bool {
+    CANCELLED_MEETING_KEYS.contains(&entry.meeting_key)
+}
+
 pub enum PickerAction {
     Quit,
     Select {
@@ -36,6 +45,7 @@ pub async fn run(
         .unwrap_or_default()
         .into_iter()
         .filter(|e| SessionType::from_api_str(&e.session_type).is_some_and(|t| t.is_supported()))
+        .filter(|e| !is_cancelled(e))
         .collect();
     picker.update_total();
 
@@ -149,6 +159,7 @@ fn filter_future_sessions(entries: Vec<db::SessionEntry>, year: i32) -> Vec<db::
     entries
         .into_iter()
         .filter(|e| SessionType::from_api_str(&e.session_type).is_some_and(|t| t.is_supported()))
+        .filter(|e| !is_cancelled(e))
         .filter(|e| {
             if year != current_year {
                 return true;
