@@ -4,10 +4,10 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::app::{AppState, SessionClock, Toasts, ViewMode};
-use f1core::{api, db, location, telemetry};
+use crate::app::{AppState, SessionClock, ViewMode};
+use f1core::{db, telemetry};
 
-/// Manages the lifecycle of the telemetry background fetch task.
+/// Manages the lifecycle of the telemetry chart-refresh task.
 pub struct TelemetryTask {
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
     pub shared: Option<telemetry::SharedTelemetry>,
@@ -21,17 +21,14 @@ impl TelemetryTask {
         }
     }
 
-    /// Start fetching telemetry for `driver_number`. Stops any existing task first.
-    #[allow(clippy::too_many_arguments)]
+    /// Start refreshing telemetry for `driver_number`. Stops any existing task first.
     pub fn start(
         &mut self,
         session_key: i64,
         driver_number: i64,
         lap_start: Option<String>,
-        client: &Arc<api::OpenF1Client>,
         clock: &Arc<SessionClock>,
         db: &Arc<Mutex<db::Db>>,
-        toasts: &Toasts,
     ) {
         self.stop();
 
@@ -43,25 +40,14 @@ impl TelemetryTask {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         self.stop_tx = Some(stop_tx);
 
-        let client = client.clone();
         let clock = clock.clone();
         let db = db.clone();
-        let toasts = toasts.clone();
         tokio::spawn(async move {
-            telemetry::run_telemetry_polling(
-                session_key,
-                client,
-                clock,
-                db,
-                shared,
-                toasts,
-                stop_rx,
-            )
-            .await;
+            telemetry::run_telemetry_chart_refresh(session_key, clock, db, shared, stop_rx).await;
         });
     }
 
-    /// Stop the current telemetry fetch task, if running.
+    /// Stop the current telemetry refresh task, if running.
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(true);
@@ -70,79 +56,10 @@ impl TelemetryTask {
     }
 }
 
-/// Manages the lifecycle of the location background fetch task.
-pub struct LocationTask {
-    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
-    /// Shared driver list — updated by the UI, read by the polling task.
-    pub drivers: Arc<Mutex<Vec<i64>>>,
-    running: bool,
-}
-
-impl LocationTask {
-    pub fn new() -> Self {
-        Self {
-            stop_tx: None,
-            drivers: Arc::new(Mutex::new(Vec::new())),
-            running: false,
-        }
-    }
-
-    /// Start the location polling task if not already running.
-    pub fn start(
-        &mut self,
-        session_key: i64,
-        client: &Arc<api::OpenF1Client>,
-        clock: &Arc<SessionClock>,
-        db: &Arc<Mutex<db::Db>>,
-        toasts: &Toasts,
-    ) {
-        if self.running {
-            return;
-        }
-
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        self.stop_tx = Some(stop_tx);
-        self.running = true;
-
-        let client = client.clone();
-        let clock = clock.clone();
-        let db = db.clone();
-        let drivers = self.drivers.clone();
-        let toasts = toasts.clone();
-        tokio::spawn(async move {
-            location::run_location_polling(
-                session_key,
-                client,
-                clock,
-                db,
-                drivers,
-                toasts,
-                stop_rx,
-            )
-            .await;
-        });
-    }
-
-    /// Stop the location polling task.
-    pub fn stop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(true);
-        }
-        self.running = false;
-    }
-
-    /// Sync the shared driver list with the current selection from AppState.
-    pub fn update_drivers(&self, state: &AppState) {
-        let mut drivers = self.drivers.lock().unwrap();
-        *drivers = state.selected_drivers.iter().copied().collect();
-    }
-}
-
 /// Switch telemetry to an adjacent driver (+1 = next, -1 = previous).
 fn switch_telemetry_driver(
     state: &mut AppState,
     telem_task: &mut TelemetryTask,
-    client: &Arc<api::OpenF1Client>,
     db: &Arc<Mutex<db::Db>>,
     session_key: i64,
     current_dn: i64,
@@ -150,15 +67,7 @@ fn switch_telemetry_driver(
 ) {
     if let Some(dn) = telemetry::cycle_driver(&state.session.rows, current_dn, delta) {
         let lap_start = state.driver_lap_start(dn);
-        telem_task.start(
-            session_key,
-            dn,
-            lap_start,
-            client,
-            &state.clock,
-            db,
-            &state.toasts,
-        );
+        telem_task.start(session_key, dn, lap_start, &state.clock, db);
         state.view_mode = ViewMode::Telemetry { driver_number: dn };
     }
 }
@@ -175,7 +84,6 @@ pub fn handle_input(
     state: &mut AppState,
     timeout: Duration,
     telem_task: &mut TelemetryTask,
-    client: &Arc<api::OpenF1Client>,
     db: &Arc<Mutex<db::Db>>,
     session_key: i64,
 ) -> Result<bool> {
@@ -194,15 +102,7 @@ pub fn handle_input(
                 KeyCode::Char('t') => {
                     if let Some(dn) = state.selected_driver() {
                         let lap_start = state.driver_lap_start(dn);
-                        telem_task.start(
-                            session_key,
-                            dn,
-                            lap_start,
-                            client,
-                            &state.clock,
-                            db,
-                            &state.toasts,
-                        );
+                        telem_task.start(session_key, dn, lap_start, &state.clock, db);
                         state.view_mode = ViewMode::Telemetry { driver_number: dn };
                     }
                 }
@@ -245,7 +145,6 @@ pub fn handle_input(
                         switch_telemetry_driver(
                             state,
                             telem_task,
-                            client,
                             db,
                             session_key,
                             current_dn,
@@ -256,7 +155,6 @@ pub fn handle_input(
                         switch_telemetry_driver(
                             state,
                             telem_task,
-                            client,
                             db,
                             session_key,
                             current_dn,

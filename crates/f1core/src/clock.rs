@@ -66,7 +66,7 @@ impl SessionClock {
     /// Uses fixed 6-digit fractional seconds so string comparison with
     /// API timestamps (which always include fractional seconds) works correctly.
     pub fn ceiling(&self) -> String {
-        crate::buffer::fmt_ts(self.now())
+        crate::util::time::fmt_ts(self.now())
     }
 
     /// Formatted elapsed session time for display, e.g. "0:42:15"

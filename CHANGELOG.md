@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.33.0
+
+- Removed the `FetchFrontier` pre-fetch coordinator and the redundant location/telemetry pollers
+  - `crates/f1core/src/buffer.rs` deleted; `fmt_ts` / `parse_ts` moved to `crates/f1core/src/util/time.rs` next to `parse_gmt_offset`. The struct's "buffer 10 minutes ahead in 2-minute chunks" model never made sense for live (data ahead of `now` doesn't exist yet) and was unreachable on replay (`bootstrap_session_data` already pre-loads every driver's full-session car_data + location into SQLite). On live the cursor would march into the future on empty API responses; on replay the code was gated out by `skip_api`. Deleted along with `BUFFER_AHEAD_SECS` / `CHUNK_SECS`
+  - `crates/f1core/src/location.rs` deleted entirely. `run_location_polling` was a pure REST duplicate of the `v1/location` topic that `run_mqtt_streaming` already writes to SQLite, and it short-circuited to a stop-only `await` for replays. The track map render path in `pages/session.rs` reads `get_latest_locations` from SQLite directly each frame, which is unchanged. `crates/pw/src/pages/input.rs` `LocationTask` and the start/stop wiring in `pages/session.rs` are gone with it
+  - `crates/f1core/src/telemetry.rs` `run_telemetry_polling` renamed to `run_telemetry_chart_refresh` and stripped to its only useful job: read the 360s display window from SQLite into `TelemetryState` every 250ms and call `recompute_charts` when the row count changes. The redundant `OpenF1Client::get_car_data` branch (already gated by `skip_api` on replay, redundant with MQTT on live) and its `Toasts` plumbing are gone. Seek-clear behavior preserved via a local `last_seek_gen` instead of `FetchFrontier::check_seek`
+  - `crates/pw/src/pages/input.rs` `TelemetryTask::start` no longer takes `client` or `toasts`. `handle_input` and `run_event_loop` shed the now-unused `client` parameter
+
 ## 0.32.0
 
 - TUI replay bootstrap rewritten in `pw` for fast, all-driver chunked fetches

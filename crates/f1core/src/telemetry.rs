@@ -1,10 +1,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use crate::api::OpenF1Client;
 use crate::clock::SessionClock;
 use crate::session_data::BoardRows;
-use crate::toast::{Toasts, push_toast};
 
 /// A single car_data sample, compact in-memory representation.
 #[derive(Debug, Clone)]
@@ -180,28 +178,22 @@ pub fn cycle_driver(rows: &BoardRows, current_driver: i64, delta: isize) -> Opti
     Some(driver_numbers[new_idx])
 }
 
-/// Background task that pre-fetches car_data in 2-minute chunks into SQLite,
-/// then reads the display window back into TelemetryState for chart rendering.
-pub async fn run_telemetry_polling(
+/// Refresh `TelemetryState` from SQLite for chart rendering.
+///
+/// Data ingestion happens elsewhere — `mqtt::run_mqtt_streaming` (live) and
+/// `pw::bootstrap` / `polling::bootstrap_session_data` (replay) — so this task
+/// only re-reads the display window each tick and recomputes chart points.
+pub async fn run_telemetry_chart_refresh(
     session_key: i64,
-    client: Arc<OpenF1Client>,
     clock: Arc<SessionClock>,
     db: Arc<Mutex<crate::db::Db>>,
     state: SharedTelemetry,
-    toasts: Toasts,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    use crate::buffer::{FetchFrontier, fmt_ts};
+    use crate::util::time::fmt_ts;
 
-    let mut frontier = FetchFrontier::new();
-    // On replays, `bootstrap_session_data` pre-loads car_data into SQLite for
-    // every driver — skip per-driver chunked fetches and just read DB faster.
-    let skip_api = !clock.is_live;
-    let cycle_duration = if skip_api {
-        std::time::Duration::from_millis(250)
-    } else {
-        std::time::Duration::from_secs(3)
-    };
+    let cycle_duration = std::time::Duration::from_millis(250);
+    let mut last_seek_gen = clock.seek_generation.load(Ordering::Relaxed);
 
     loop {
         if *stop.borrow() {
@@ -211,42 +203,14 @@ pub async fn run_telemetry_polling(
         let cycle_start = std::time::Instant::now();
         let now = clock.now();
 
-        // Reset on seek
         let seek_gen = clock.seek_generation.load(Ordering::Relaxed);
-        let did_seek = frontier.check_seek(seek_gen);
-        if did_seek {
+        if seek_gen != last_seek_gen {
+            last_seek_gen = seek_gen;
             state.lock().unwrap().clear();
         }
 
         let driver_number = state.lock().unwrap().driver_number;
 
-        // Fetch next chunk into SQLite if needed (300s backfill on first fetch)
-        if !skip_api && let Some((from, to)) = frontier.next_chunk(now, 300) {
-            let result = client
-                .get_car_data(
-                    session_key,
-                    driver_number,
-                    Some(&fmt_ts(from)),
-                    None,
-                    Some(&fmt_ts(to)),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    if !data.is_empty() {
-                        let db = db.lock().unwrap();
-                        let _ = db.upsert_car_data(session_key, &data);
-                    }
-                    frontier.advance(to);
-                }
-                Err(e) => {
-                    push_toast(&toasts, format!("car_data: {e}"), true);
-                }
-            }
-        }
-
-        // Read display window from SQLite into TelemetryState
         {
             let window_start = fmt_ts(now - chrono::Duration::seconds(360));
             let ceiling = fmt_ts(now);

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use f1core::api::OpenF1Client;
-use f1core::buffer::{fmt_ts, parse_ts};
+use f1core::util::time::{fmt_ts, parse_ts};
 use f1core::db::Db;
 use f1core::toast::{Toasts, push_toast};
 
