@@ -1,4 +1,19 @@
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
+
+pub fn fmt_ts(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
+}
+
+pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f+00:00")
+                .map(|ndt| ndt.and_utc())
+                .ok()
+        })
+}
 
 /// Parse "HH:MM:SS" gmt_offset string (from OpenF1 API) into a chrono FixedOffset.
 pub fn parse_gmt_offset(s: &str) -> Option<FixedOffset> {

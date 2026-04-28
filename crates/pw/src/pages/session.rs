@@ -5,7 +5,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::input::{LocationTask, TelemetryTask, handle_input};
+use super::input::{TelemetryTask, handle_input};
 use crate::{app, bootstrap, session_types::SessionType, ui};
 use app::{AppState, SessionClock, ViewMode};
 use f1core::{api, db, polling};
@@ -121,7 +121,7 @@ pub async fn run(
     let mut state = AppState::new(session_key, session_type, toasts, clock, authenticated);
     state.bootstrap_status = bootstrap_status;
 
-    let result = run_event_loop(terminal, &mut state, db, client, session_key);
+    let result = run_event_loop(terminal, &mut state, db, session_key);
 
     let _ = stop_tx.send(true);
 
@@ -132,23 +132,19 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
     db: &Arc<Mutex<db::Db>>,
-    client: &Arc<api::OpenF1Client>,
     session_key: i64,
 ) -> Result<()> {
     let mut telem_task = TelemetryTask::new();
-    let mut loc_task = LocationTask::new();
 
     loop {
         if handle_input(
             state,
             Duration::from_millis(0),
             &mut telem_task,
-            client,
             db,
             session_key,
         )? {
             telem_task.stop();
-            loc_task.stop();
             return Ok(());
         }
 
@@ -184,14 +180,6 @@ fn run_event_loop(
             }
         }
 
-        // Start/stop location polling based on track map state
-        if state.view_mode == ViewMode::TrackMap && !state.selected_drivers.is_empty() {
-            loc_task.update_drivers(state);
-            loc_task.start(session_key, client, &state.clock, db, &state.toasts);
-        } else {
-            loc_task.stop();
-        }
-
         // Read locations from DB when track map is active
         let locations =
             if state.view_mode == ViewMode::TrackMap && !state.selected_drivers.is_empty() {
@@ -211,12 +199,10 @@ fn run_event_loop(
             state,
             Duration::from_millis(100),
             &mut telem_task,
-            client,
             db,
             session_key,
         )? {
             telem_task.stop();
-            loc_task.stop();
             return Ok(());
         }
     }

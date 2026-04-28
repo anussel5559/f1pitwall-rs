@@ -174,18 +174,16 @@ crates/
 ├── f1core/       # Shared library — no UI dependencies
 │   ├── api/            # OpenF1 HTTP client + data models
 │   ├── auth            # OAuth tokens + OS keychain
-│   ├── buffer          # Chunked pre-fetch frontier (shared by location + telemetry)
 │   ├── clock           # Virtual session clock (live + replay)
 │   ├── db/             # SQLite persistence (rusqlite)
 │   ├── domain/         # Business rules (positions, sectors, DRS, track outlines, degradation, strategy, alerts, ml)
-│   ├── location        # Driver location polling + SQLite buffering
-│   ├── mqtt            # Live MQTT streaming
+│   ├── mqtt            # Live MQTT streaming (ingests car_data + location)
 │   ├── polling         # API fetch orchestration + replay idle loop
 │   ├── session_data    # SessionData, DisplayRow, BoardRows types
 │   ├── session_types   # SessionType/Endpoint enums + bootstrap logic
-│   ├── telemetry       # Car telemetry state + SQLite-backed polling
+│   ├── telemetry       # Car telemetry state + chart-state refresh from SQLite
 │   ├── toast           # Notification system
-│   └── util            # Time parsing helpers
+│   └── util            # Time + GMT-offset parsing helpers
 └── pw/           # Terminal frontend — ratatui + crossterm
     ├── app             # AppState (wraps f1core types + UI state)
     ├── pages/          # Session, picker, login page controllers
