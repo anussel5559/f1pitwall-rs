@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.1
+
+- Drop `time_delta_s` from Pitwall Manager scoring (`crates/f1core/src/domain/pm_score.rs`)
+  - The field was meant to be a "time vs ghost call" component, but post-pit pace measures the team's actual stop, not the player's call quality — two players who called different laps for the same driver would get the same value, so it's orthogonal to call quality and adds noise without insight. Without a counterfactual sim, cutting the field is preferable to keeping a misleading metric
+  - Removes `ScoreInputs::time_delta_s`, `ScoreWeights::time_per_tenth`, `ScoreBreakdown::time`, and the corresponding term in `score_breakdown` / `ScoreBreakdown::total`. The `time_delta_s` column in the `resolved_calls` table is left in place — it's a separate persistence concern and the consumer can stop populating it independently. Breaking API change for downstream consumers; the only one (private `f1-pitwall` `crates/pitwall/src/pm.rs`) will be updated in a follow-up
+
 ## 0.33.0
 
 - Removed the `FetchFrontier` pre-fetch coordinator and the redundant location/telemetry pollers

@@ -17,9 +17,6 @@ pub struct ScoreInputs {
     /// Position change from start of the call window to one lap after the
     /// real pit (positive = gained places vs. ghost).
     pub position_delta: i32,
-    /// Time-to-leader delta over a 5-lap rolling window post-stop, in seconds
-    /// (negative = faster than the ghost call).
-    pub time_delta_s: f64,
     /// Lap on which the player locked the call.
     pub locked_at_lap: i64,
     /// Live mode only: seconds between locking and the real pit-entry.
@@ -34,7 +31,6 @@ pub struct ScoreWeights {
     pub base: i32,
     pub lap_accuracy_max: i32,
     pub position_per_place: i32,
-    pub time_per_tenth: i32,
     pub late_penalty: i32,
     pub late_penalty_lap_threshold: i64,
     pub anti_cheat_penalty: i32,
@@ -53,7 +49,6 @@ impl Default for ScoreWeights {
             base: 100,
             lap_accuracy_max: 50,
             position_per_place: 30,
-            time_per_tenth: 1,
             late_penalty: 20,
             late_penalty_lap_threshold: 2,
             anti_cheat_penalty: 100, // effectively zeroes the call
@@ -73,7 +68,6 @@ pub struct ScoreBreakdown {
     pub base: i32,
     pub lap_accuracy: i32,
     pub position: i32,
-    pub time: i32,
     pub early_conviction: i32,
     pub late_penalty: i32,
     pub anti_cheat_penalty: i32,
@@ -81,7 +75,7 @@ pub struct ScoreBreakdown {
 
 impl ScoreBreakdown {
     pub fn total(&self) -> i32 {
-        self.base + self.lap_accuracy + self.position + self.time + self.early_conviction
+        self.base + self.lap_accuracy + self.position + self.early_conviction
             - self.late_penalty
             - self.anti_cheat_penalty
     }
@@ -95,7 +89,6 @@ impl ScoreBreakdown {
 /// base
 ///   + lap_accuracy_bonus       // (max - |lap_delta|) clamped to [0, max]
 ///   + position_delta_bonus     // ±per_place * position_delta
-///   + time_delta_bonus         // per_tenth * (-time_delta_s * 10)
 ///   + early_conviction_bonus   // per_lap * max(0, lead - threshold), capped at max
 ///   − late_penalty             // if locked < threshold laps before pit
 ///   − anti_cheat_penalty       // live only, if locked < N s before pit entry
@@ -105,10 +98,6 @@ pub fn score_breakdown(inputs: ScoreInputs, w: ScoreWeights) -> ScoreBreakdown {
     let lap_accuracy = (w.lap_accuracy_max - lap_delta).max(0);
 
     let position = w.position_per_place * inputs.position_delta;
-
-    // Negative time_delta means we were faster than the ghost — that earns points.
-    let time_tenths = (-inputs.time_delta_s * 10.0).round() as i32;
-    let time = w.time_per_tenth * time_tenths;
 
     let lap_gap_to_pit = (inputs.real_lap - inputs.locked_at_lap).max(0);
     let late_penalty = if lap_gap_to_pit < w.late_penalty_lap_threshold {
@@ -132,7 +121,6 @@ pub fn score_breakdown(inputs: ScoreInputs, w: ScoreWeights) -> ScoreBreakdown {
         base: w.base,
         lap_accuracy,
         position,
-        time,
         early_conviction,
         late_penalty,
         anti_cheat_penalty,
@@ -156,7 +144,6 @@ mod tests {
             target_lap: 25,
             real_lap: 25,
             position_delta: 0,
-            time_delta_s: 0.0,
             locked_at_lap: 23,
             seconds_before_pit: Some(120.0),
         }
@@ -189,13 +176,6 @@ mod tests {
         let mut inp = perfect();
         inp.position_delta = -2;
         assert_eq!(score(inp, ScoreWeights::default()), 100 + 50 - 60);
-    }
-
-    #[test]
-    fn faster_than_ghost_earns_time_bonus() {
-        let mut inp = perfect();
-        inp.time_delta_s = -1.5; // 15 tenths faster
-        assert_eq!(score(inp, ScoreWeights::default()), 100 + 50 + 15);
     }
 
     #[test]
