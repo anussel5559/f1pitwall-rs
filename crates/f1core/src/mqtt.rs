@@ -41,6 +41,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// If no events arrive for this long while live, the connection is presumed dead.
 const STALL_THRESHOLD: Duration = Duration::from_secs(90);
 
+/// If no data (Publish) events arrive for this long, the current connection is
+/// presumed zombied (the OpenF1 broker has been observed accepting reconnects
+/// while silently publishing nothing). Tear down and try a fresh connection.
+const IDLE_RECONNECT_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+/// Number of consecutive idle reconnect cycles before giving up entirely.
+/// Total silent time before permanent stop = MAX_IDLE_CYCLES * IDLE_RECONNECT_THRESHOLD
+/// (15 min at the defaults). Any successful Publish resets the counter, so a
+/// recovered broker keeps the loop alive indefinitely.
+const MAX_IDLE_CYCLES: u32 = 3;
+
 /// Capacity of the channel between the dedicated poll task and the main event loop.
 /// Sized for ~20s of headroom at peak car_data + location rates (~200 msg/s).
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
@@ -64,6 +75,7 @@ pub async fn run_mqtt_streaming(
     let mut token_refresh = tokio::time::interval(TOKEN_REFRESH_INTERVAL);
     // First tick fires immediately — skip it since we just connected.
     token_refresh.tick().await;
+    let mut idle_cycles: u32 = 0;
 
     loop {
         let token = match get_token(&client).await {
@@ -92,7 +104,7 @@ pub async fn run_mqtt_streaming(
 
         tracing::info!(session_key, "MQTT streaming started");
 
-        let should_stop = run_event_loop(
+        let reason = run_event_loop(
             session_key,
             &db,
             &persist_high_rate,
@@ -100,6 +112,7 @@ pub async fn run_mqtt_streaming(
             eventloop,
             &mut token_refresh,
             &mut stop,
+            &mut idle_cycles,
         )
         .await;
 
@@ -107,18 +120,36 @@ pub async fn run_mqtt_streaming(
         // aborted by run_event_loop; this just tells the broker we're going.
         let _ = mqtt_client.disconnect().await;
 
-        if should_stop {
-            tracing::info!(session_key, "MQTT streaming stopped");
-            break;
+        match reason {
+            StopReason::Stop | StopReason::PollerDied => {
+                tracing::info!(session_key, ?reason, "MQTT streaming stopped");
+                break;
+            }
+            StopReason::IdleGiveUp => {
+                tracing::info!(
+                    session_key,
+                    idle_cycles,
+                    "MQTT streaming stopped after consecutive idle cycles",
+                );
+                break;
+            }
+            StopReason::TokenRefresh => {
+                tracing::info!(session_key, "MQTT: refreshing token, reconnecting");
+                push_toast(&toasts, "MQTT: refreshing token...".into(), false);
+            }
+            StopReason::IdleReconnect => {
+                tracing::info!(
+                    session_key,
+                    idle_cycles,
+                    "MQTT: idle cycle, reconnecting fresh",
+                );
+            }
         }
-
-        tracing::info!(session_key, "MQTT: refreshing token, reconnecting");
-        push_toast(&toasts, "MQTT: refreshing token...".into(), false);
     }
 }
 
-/// Inner event loop. Returns `true` if the caller should stop entirely,
-/// `false` if a token refresh was triggered and we should reconnect.
+/// Inner event loop. Returns the reason it exited so the outer loop can decide
+/// whether to reconnect or stop.
 ///
 /// This function spawns a dedicated task to drive `EventLoop::poll()` and
 /// receives events through an mpsc channel. This is critical: `EventLoop::poll()`
@@ -127,6 +158,7 @@ pub async fn run_mqtt_streaming(
 /// — partial packet buffers, the keep-alive timer, in-flight tracking — and
 /// leads to silent stalls after a few minutes. mpsc::Receiver::recv IS
 /// cancellation-safe, so the timer/stop branches are now safe to fire.
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     session_key: i64,
     db: &Arc<Mutex<Db>>,
@@ -135,7 +167,8 @@ async fn run_event_loop(
     mut eventloop: rumqttc::EventLoop,
     token_refresh: &mut tokio::time::Interval,
     stop: &mut tokio::sync::watch::Receiver<bool>,
-) -> bool {
+    idle_cycles: &mut u32,
+) -> StopReason {
     let mut car_buf: Vec<CarData> = Vec::with_capacity(256);
     let mut loc_buf: Vec<Location> = Vec::with_capacity(256);
     let mut flush_tick = tokio::time::interval(BATCH_FLUSH_INTERVAL);
@@ -178,8 +211,19 @@ async fn run_event_loop(
                     push_toast(toasts, "MQTT: poll task died".into(), true);
                     break StopReason::PollerDied;
                 };
-                last_event_at = tokio::time::Instant::now();
-                stall_warned = false;
+                // Only treat real Publish events as "session is alive" signals.
+                // Errors (TLS EOF on reconnect after session end), ConnAck, and
+                // keepalive packets must NOT reset the idle timer — otherwise a
+                // dead broker that keeps failing the TLS handshake looks "live"
+                // forever and IDLE_STOP_THRESHOLD never trips.
+                if matches!(&event, Ok(Event::Incoming(Packet::Publish(_)))) {
+                    last_event_at = tokio::time::Instant::now();
+                    stall_warned = false;
+                    // A real Publish proves the broker is alive — clear the
+                    // accumulated dead-cycle count so we don't permanently
+                    // give up after a transient outage that recovered.
+                    *idle_cycles = 0;
+                }
                 handle_event(
                     session_key,
                     event,
@@ -208,6 +252,34 @@ async fn run_event_loop(
                     last_event_secs = elapsed.as_secs(),
                     "MQTT heartbeat",
                 );
+                if elapsed > IDLE_RECONNECT_THRESHOLD {
+                    *idle_cycles += 1;
+                    if *idle_cycles >= MAX_IDLE_CYCLES {
+                        tracing::info!(
+                            session_key,
+                            idle_cycles = *idle_cycles,
+                            last_event_secs = elapsed.as_secs(),
+                            "MQTT: {MAX_IDLE_CYCLES} consecutive idle cycles — giving up",
+                        );
+                        push_toast(
+                            toasts,
+                            format!(
+                                "MQTT stopped: no data for {}m across {} reconnects",
+                                elapsed.as_secs() / 60,
+                                *idle_cycles
+                            ),
+                            false,
+                        );
+                        break StopReason::IdleGiveUp;
+                    }
+                    tracing::warn!(
+                        session_key,
+                        idle_cycles = *idle_cycles,
+                        last_event_secs = elapsed.as_secs(),
+                        "MQTT: idle for {IDLE_RECONNECT_THRESHOLD:?} — tearing down zombie connection, will reconnect",
+                    );
+                    break StopReason::IdleReconnect;
+                }
                 if elapsed > STALL_THRESHOLD && !stall_warned {
                     tracing::error!(
                         session_key,
@@ -243,14 +315,24 @@ async fn run_event_loop(
     poll_handle.abort();
     let _ = poll_handle.await;
 
-    matches!(stop_reason, StopReason::Stop | StopReason::PollerDied)
+    stop_reason
 }
 
 #[derive(Debug)]
 enum StopReason {
+    /// User-driven shutdown (TUI quit). Final stop.
     Stop,
+    /// 50-min token refresh interval reached. Reconnect with a fresh token.
     TokenRefresh,
+    /// The dedicated poll task exited unexpectedly. Final stop.
     PollerDied,
+    /// No Publish events for IDLE_RECONNECT_THRESHOLD, but we haven't hit
+    /// MAX_IDLE_CYCLES yet — tear down this (probably zombied) connection
+    /// and reconnect fresh.
+    IdleReconnect,
+    /// MAX_IDLE_CYCLES consecutive idle cycles — broker has been silent
+    /// across multiple reconnects, presumed permanently dead. Final stop.
+    IdleGiveUp,
 }
 
 #[derive(Default)]

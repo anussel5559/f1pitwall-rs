@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.33.3
+
+- Bound MQTT zombie-connection retries to ~15 minutes of total silence before giving up (`crates/f1core/src/mqtt.rs`)
+  - Symptom from a Practice 1 session: at ~84/90 min into the live broker stream, the OpenF1 broker dropped the TCP connection and started accepting reconnects but publishing nothing. Heartbeat showed `last_event_secs=0 errors=1` indefinitely; toasts spammed `tls handshake eof` once a second. Nothing in the loop was time-bounded — only a user-quit `stop_tx.send(true)` could stop it. The 90 s stall watchdog only warned and re-armed, never broke out
+  - Two bugs in the existing code combined to mask broker death: (a) the event-recv branch reset `last_event_at` on **every** event from the poll task, so error events (and broker-side keepalive PingResps every 30 s on a freshly-reconnected zombie connection) continually masqueraded as activity — the stall watchdog read `last_event_secs=28` forever even with zero real data flowing; (b) the watchdog had no escalation path. The post-mortem against OpenF1's REST `/car_data` confirmed the broker outage was purely an MQTT-side problem — REST kept receiving 3 Hz telemetry through scheduled session end and beyond, so disconnecting on broker silence is the right call
+  - Fix:
+    - `last_event_at` updates only on `Event::Incoming(Packet::Publish(_))` — real broker data. Errors, ConnAck, PingResp etc. no longer reset the timer, so a dead broker can no longer impersonate a live one via keepalive traffic
+    - On the heartbeat tick, if `IDLE_RECONNECT_THRESHOLD` (5 min) elapses with no Publish, the inner loop breaks with `StopReason::IdleReconnect` and the outer loop tears down the zombied EventLoop and reconnects from scratch — same disconnect-then-reconnect path that token refresh already uses, just triggered by silence instead of a 50-min interval
+    - A new `idle_cycles` counter tracked across reconnects: each idle break increments it, any successful Publish resets it to 0. After `MAX_IDLE_CYCLES` (3) consecutive idle cycles → `StopReason::IdleGiveUp` and the outer loop breaks too. So a transient OpenF1 outage that recovers within ~15 min keeps the loop alive; one that stays dead caps the noise and stops cleanly. Maximum silent time before permanent stop is 3 × 5 min = 15 min, which the user wanted as the upper bound for "broker is not coming back this session"
+
 ## 0.33.2
 
 - Fix MQTT live ingestion silently stalling after ~8 minutes (`crates/f1core/src/mqtt.rs`)
