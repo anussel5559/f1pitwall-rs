@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use rumqttc::{AsyncClient, ConnectionError, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, ConnectionError, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport,
+};
 
 use crate::api::OpenF1Client;
 use crate::api::models::{
@@ -276,62 +278,55 @@ fn handle_event(
     toasts: &Toasts,
 ) {
     match event {
-        Ok(Event::Incoming(Packet::Publish(publish))) => {
-            match publish.topic.as_str() {
-                "v1/car_data" => {
-                    counts.car_data += 1;
-                    if persist_high_rate.load(Ordering::Relaxed) {
-                        match serde_json::from_slice::<CarData>(&publish.payload) {
-                            Ok(d) => {
-                                if d.session_key == Some(session_key) {
-                                    car_buf.push(d);
-                                }
-                            }
-                            Err(e) => {
-                                counts.errors += 1;
-                                tracing::warn!(error = %e, "MQTT v1/car_data parse failed");
-                                push_toast(toasts, format!("MQTT v1/car_data: {e}"), true);
+        Ok(Event::Incoming(Packet::Publish(publish))) => match publish.topic.as_str() {
+            "v1/car_data" => {
+                counts.car_data += 1;
+                if persist_high_rate.load(Ordering::Relaxed) {
+                    match serde_json::from_slice::<CarData>(&publish.payload) {
+                        Ok(d) => {
+                            if d.session_key == Some(session_key) {
+                                car_buf.push(d);
                             }
                         }
-                    }
-                }
-                "v1/location" => {
-                    counts.location += 1;
-                    if persist_high_rate.load(Ordering::Relaxed) {
-                        match serde_json::from_slice::<Location>(&publish.payload) {
-                            Ok(d) => {
-                                if d.session_key == Some(session_key) {
-                                    loc_buf.push(d);
-                                }
-                            }
-                            Err(e) => {
-                                counts.errors += 1;
-                                tracing::warn!(error = %e, "MQTT v1/location parse failed");
-                                push_toast(toasts, format!("MQTT v1/location: {e}"), true);
-                            }
+                        Err(e) => {
+                            counts.errors += 1;
+                            tracing::warn!(error = %e, "MQTT v1/car_data parse failed");
+                            push_toast(toasts, format!("MQTT v1/car_data: {e}"), true);
                         }
-                    }
-                }
-                other => {
-                    match other {
-                        "v1/laps" => counts.laps += 1,
-                        "v1/position" => counts.position += 1,
-                        "v1/intervals" => counts.intervals += 1,
-                        _ => counts.other += 1,
-                    }
-                    if let Err(e) = dispatch_message(
-                        session_key,
-                        other,
-                        &publish.payload,
-                        db,
-                    ) {
-                        counts.errors += 1;
-                        tracing::warn!(topic = other, error = %e, "MQTT dispatch failed");
-                        push_toast(toasts, format!("MQTT {other}: {e}"), true);
                     }
                 }
             }
-        }
+            "v1/location" => {
+                counts.location += 1;
+                if persist_high_rate.load(Ordering::Relaxed) {
+                    match serde_json::from_slice::<Location>(&publish.payload) {
+                        Ok(d) => {
+                            if d.session_key == Some(session_key) {
+                                loc_buf.push(d);
+                            }
+                        }
+                        Err(e) => {
+                            counts.errors += 1;
+                            tracing::warn!(error = %e, "MQTT v1/location parse failed");
+                            push_toast(toasts, format!("MQTT v1/location: {e}"), true);
+                        }
+                    }
+                }
+            }
+            other => {
+                match other {
+                    "v1/laps" => counts.laps += 1,
+                    "v1/position" => counts.position += 1,
+                    "v1/intervals" => counts.intervals += 1,
+                    _ => counts.other += 1,
+                }
+                if let Err(e) = dispatch_message(session_key, other, &publish.payload, db) {
+                    counts.errors += 1;
+                    tracing::warn!(topic = other, error = %e, "MQTT dispatch failed");
+                    push_toast(toasts, format!("MQTT {other}: {e}"), true);
+                }
+            }
+        },
         Ok(Event::Incoming(Packet::ConnAck(_))) => {
             tracing::info!(session_key, "MQTT ConnAck received");
             push_toast(toasts, "MQTT connected".into(), false);
