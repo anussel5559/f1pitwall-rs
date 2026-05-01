@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.33.2
+
+- Fix MQTT live ingestion silently stalling after ~8 minutes (`crates/f1core/src/mqtt.rs`)
+  - Root cause: `rumqttc::EventLoop::poll()` was being awaited directly inside `tokio::select!` alongside `flush_tick` (250ms), `token_refresh`, and `stop`. `EventLoop::poll()` is **not cancellation-safe** — every time another `select!` branch fired (thousands of times per minute via `flush_tick`), the in-flight `poll()` was dropped mid-await, corrupting partial-packet read state and the keep-alive timer. After enough cancel cycles the keep-alive PINGREQ stopped going out, the broker silently closed the TCP connection, and the next `poll()` returned errors that `rumqttc`'s automatic reconnect couldn't recover from. The 8-minute symptom was the time it took the cancellation drift to accumulate into a non-recoverable state. A process restart fixed it because it rebuilt the `EventLoop` from scratch
+  - Fix: the `EventLoop` now lives in a dedicated `tokio::spawn`'d task that's the only caller of `poll()` — never cancelled mid-await. Events are forwarded to the main loop through a bounded `tokio::mpsc::channel(4096)`, and the main `select!` reads from `event_rx.recv()` (which IS cancellation-safe) instead of `poll()`. On exit, the poll task is `abort()`ed and its `JoinHandle` is awaited; the `EventLoop` is dropped with the task. Channel capacity is sized for ~20s of headroom at peak car_data + location rates so transient SQLite write hiccups don't backpressure the broker into disconnecting
+  - Observability: the module previously logged exclusively through `push_toast` (a 5-entry UI ring buffer in `crate::toast`), so `tracing` subscribers saw nothing when the connection died — hence "no log lines" before a restart. Every error/state-change site now emits a `tracing` event alongside the toast: `info!` on connect/disconnect/token-refresh/stop, `warn!` on poll errors and parse failures, `error!` on flush failures and unexpected poll-task exit
+  - New 60s heartbeat log with per-topic message counts (`laps`, `position`, `intervals`, `car_data`, `location`, `other`) and `last_event_secs` — lets operators see ingestion rate at a glance and notice silence immediately. New 90s stall watchdog: if no events arrive while live, logs an `error!` + emits a toast once (re-arms after the next event), giving an explicit signal instead of dead silence
+- Bump `rumqttc` 0.24 → 0.25, `rustls` 0.22 → 0.23, `rustls-native-certs` 0.7 → 0.8 (`crates/f1core/Cargo.toml`)
+  - `rumqttc` 0.25 is a non-breaking bump for our usage (`TlsConfiguration::Rustls(Arc<ClientConfig>)` and `Transport::tls_with_config` keep the same shape); came along with the cancel-safety fix to stay current
+  - `rustls` 0.23 requires a `CryptoProvider` to be installed before `ClientConfig::builder()`; new `ensure_crypto_provider()` calls `rustls::crypto::aws_lc_rs::default_provider().install_default()` once per process via `std::sync::Once`
+  - `rustls-native-certs` 0.8 returns `CertificateResult` instead of `Result<Vec<Certificate>>`; partial cert-load errors that were previously swallowed are now surfaced as `tracing::warn!`
+
 ## 0.33.1
 
 - Drop `time_delta_s` from Pitwall Manager scoring (`crates/f1core/src/domain/pm_score.rs`)

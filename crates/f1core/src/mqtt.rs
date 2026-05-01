@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{AsyncClient, ConnectionError, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 
 use crate::api::OpenF1Client;
 use crate::api::models::{
@@ -15,7 +15,6 @@ use crate::toast::{Toasts, push_toast};
 const BROKER_HOST: &str = "mqtt.openf1.org";
 const BROKER_PORT: u16 = 8883;
 
-/// Topics to subscribe to for live session data.
 const TOPICS: &[&str] = &[
     "v1/laps",
     "v1/position",
@@ -33,6 +32,16 @@ const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(50 * 60);
 
 /// How often to flush buffered high-rate messages (car_data, location) to SQLite.
 const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often to log a heartbeat with message rates.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// If no events arrive for this long while live, the connection is presumed dead.
+const STALL_THRESHOLD: Duration = Duration::from_secs(90);
+
+/// Capacity of the channel between the dedicated poll task and the main event loop.
+/// Sized for ~20s of headroom at peak car_data + location rates (~200 msg/s).
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 /// Run MQTT-based live streaming for a session.
 ///
@@ -58,136 +67,284 @@ pub async fn run_mqtt_streaming(
         let token = match get_token(&client).await {
             Some(t) => t,
             None => {
+                tracing::error!(session_key, "MQTT: no auth token available — aborting");
                 push_toast(&toasts, "MQTT: no auth token available".into(), true);
                 return;
             }
         };
 
-        let (mqtt_client, mut eventloop) = match connect(&token) {
+        let (mqtt_client, eventloop) = match connect(&token) {
             Ok(pair) => pair,
             Err(e) => {
+                tracing::error!(session_key, error = %e, "MQTT connect failed");
                 push_toast(&toasts, format!("MQTT connect: {e}"), true);
                 return;
             }
         };
 
         if let Err(e) = subscribe(&mqtt_client).await {
+            tracing::error!(session_key, error = %e, "MQTT subscribe failed");
             push_toast(&toasts, format!("MQTT subscribe: {e}"), true);
             return;
         }
+
+        tracing::info!(session_key, "MQTT streaming started");
 
         let should_stop = run_event_loop(
             session_key,
             &db,
             &persist_high_rate,
             &toasts,
-            &mut eventloop,
+            eventloop,
             &mut token_refresh,
             &mut stop,
         )
         .await;
 
-        // Disconnect cleanly before potential reconnect.
+        // Disconnect cleanly before potential reconnect. The poll task is already
+        // aborted by run_event_loop; this just tells the broker we're going.
         let _ = mqtt_client.disconnect().await;
 
         if should_stop {
+            tracing::info!(session_key, "MQTT streaming stopped");
             break;
         }
 
-        // Token refresh triggered — loop back to reconnect with fresh token.
+        tracing::info!(session_key, "MQTT: refreshing token, reconnecting");
         push_toast(&toasts, "MQTT: refreshing token...".into(), false);
     }
 }
 
 /// Inner event loop. Returns `true` if the caller should stop entirely,
 /// `false` if a token refresh was triggered and we should reconnect.
+///
+/// This function spawns a dedicated task to drive `EventLoop::poll()` and
+/// receives events through an mpsc channel. This is critical: `EventLoop::poll()`
+/// is NOT cancellation-safe. Calling it directly inside `tokio::select!` (where
+/// other branches can cause it to be dropped mid-await) corrupts internal state
+/// — partial packet buffers, the keep-alive timer, in-flight tracking — and
+/// leads to silent stalls after a few minutes. mpsc::Receiver::recv IS
+/// cancellation-safe, so the timer/stop branches are now safe to fire.
 async fn run_event_loop(
     session_key: i64,
     db: &Arc<Mutex<Db>>,
     persist_high_rate: &Arc<AtomicBool>,
     toasts: &Toasts,
-    eventloop: &mut rumqttc::EventLoop,
+    mut eventloop: rumqttc::EventLoop,
     token_refresh: &mut tokio::time::Interval,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let mut car_buf: Vec<CarData> = Vec::with_capacity(256);
     let mut loc_buf: Vec<Location> = Vec::with_capacity(256);
     let mut flush_tick = tokio::time::interval(BATCH_FLUSH_INTERVAL);
-    // Skip the immediate-fire first tick.
     flush_tick.tick().await;
+    let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat_tick.tick().await;
 
-    loop {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<PollResult>(EVENT_CHANNEL_CAPACITY);
+
+    // Spawn the dedicated poll task. It owns the EventLoop and is the ONLY
+    // place that calls .poll(), so .poll() is never cancelled mid-await.
+    let poll_handle = tokio::spawn(async move {
+        loop {
+            let event = eventloop.poll().await;
+            let was_err = event.is_err();
+            if event_tx.send(event).await.is_err() {
+                // Receiver dropped — main loop is exiting.
+                break;
+            }
+            if was_err {
+                // Brief backoff between failed polls so a hard-failed connection
+                // doesn't burn a CPU core. rumqttc auto-reconnects on next poll().
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    });
+
+    let mut counts = MessageCounts::default();
+    let mut last_event_at = tokio::time::Instant::now();
+    let mut stall_warned = false;
+
+    let stop_reason = loop {
         tokio::select! {
-            event = eventloop.poll() => {
-                match event {
-                    Ok(Event::Incoming(Packet::Publish(publish))) => {
-                        match publish.topic.as_str() {
-                            "v1/car_data" => {
-                                if persist_high_rate.load(Ordering::Relaxed) {
-                                    match serde_json::from_slice::<CarData>(&publish.payload) {
-                                        Ok(d) => {
-                                            if d.session_key == Some(session_key) {
-                                                car_buf.push(d);
-                                            }
-                                        }
-                                        Err(e) => push_toast(
-                                            toasts,
-                                            format!("MQTT v1/car_data: {e}"),
-                                            true,
-                                        ),
-                                    }
-                                }
-                            }
-                            "v1/location" => {
-                                if persist_high_rate.load(Ordering::Relaxed) {
-                                    match serde_json::from_slice::<Location>(&publish.payload) {
-                                        Ok(d) => {
-                                            if d.session_key == Some(session_key) {
-                                                loc_buf.push(d);
-                                            }
-                                        }
-                                        Err(e) => push_toast(
-                                            toasts,
-                                            format!("MQTT v1/location: {e}"),
-                                            true,
-                                        ),
-                                    }
-                                }
-                            }
-                            other => {
-                                if let Err(e) = dispatch_message(
-                                    session_key,
-                                    other,
-                                    &publish.payload,
-                                    db,
-                                ) {
-                                    push_toast(toasts, format!("MQTT {other}: {e}"), true);
-                                }
-                            }
-                        }
-                    }
-                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        push_toast(toasts, "MQTT connected".into(), false);
-                    }
-                    Err(e) => {
-                        push_toast(toasts, format!("MQTT: {e}"), true);
-                        // rumqttc will attempt automatic reconnection on the next poll().
-                    }
-                    _ => {}
-                }
+            // Channel recv is cancel-safe — the timer/stop branches firing here
+            // does NOT interrupt the eventloop poller.
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    // Poll task exited (event_tx dropped). Treat as fatal.
+                    tracing::error!(session_key, "MQTT poll task exited unexpectedly");
+                    push_toast(toasts, "MQTT: poll task died".into(), true);
+                    break StopReason::PollerDied;
+                };
+                last_event_at = tokio::time::Instant::now();
+                stall_warned = false;
+                handle_event(
+                    session_key,
+                    event,
+                    &mut car_buf,
+                    &mut loc_buf,
+                    &mut counts,
+                    persist_high_rate,
+                    db,
+                    toasts,
+                );
             }
             _ = flush_tick.tick() => {
                 flush_buffers(session_key, db, toasts, &mut car_buf, &mut loc_buf);
             }
+            _ = heartbeat_tick.tick() => {
+                let elapsed = last_event_at.elapsed();
+                tracing::info!(
+                    session_key,
+                    laps = counts.laps,
+                    position = counts.position,
+                    intervals = counts.intervals,
+                    car_data = counts.car_data,
+                    location = counts.location,
+                    other = counts.other,
+                    errors = counts.errors,
+                    last_event_secs = elapsed.as_secs(),
+                    "MQTT heartbeat",
+                );
+                if elapsed > STALL_THRESHOLD && !stall_warned {
+                    tracing::error!(
+                        session_key,
+                        last_event_secs = elapsed.as_secs(),
+                        "MQTT: no events for {STALL_THRESHOLD:?} — connection may be stalled",
+                    );
+                    push_toast(
+                        toasts,
+                        format!("MQTT stalled: {}s without events", elapsed.as_secs()),
+                        true,
+                    );
+                    stall_warned = true;
+                }
+                counts = MessageCounts::default();
+            }
             _ = token_refresh.tick() => {
-                flush_buffers(session_key, db, toasts, &mut car_buf, &mut loc_buf);
-                return false;
+                tracing::info!(session_key, "MQTT: token refresh interval reached");
+                break StopReason::TokenRefresh;
             }
             _ = stop.changed() => {
-                flush_buffers(session_key, db, toasts, &mut car_buf, &mut loc_buf);
-                return true;
+                tracing::info!(session_key, "MQTT: stop signal received");
+                break StopReason::Stop;
             }
         }
+    };
+
+    flush_buffers(session_key, db, toasts, &mut car_buf, &mut loc_buf);
+
+    // Abort the poll task — this drops the EventLoop and its underlying
+    // connection. Any partially-received packet is discarded, which is fine
+    // because we're about to either stop entirely or reconnect with a fresh
+    // EventLoop on the next iteration of the outer loop.
+    poll_handle.abort();
+    let _ = poll_handle.await;
+
+    matches!(stop_reason, StopReason::Stop | StopReason::PollerDied)
+}
+
+#[derive(Debug)]
+enum StopReason {
+    Stop,
+    TokenRefresh,
+    PollerDied,
+}
+
+#[derive(Default)]
+struct MessageCounts {
+    laps: u64,
+    position: u64,
+    intervals: u64,
+    car_data: u64,
+    location: u64,
+    other: u64,
+    errors: u64,
+}
+
+type PollResult = std::result::Result<Event, ConnectionError>;
+
+#[allow(clippy::too_many_arguments)]
+fn handle_event(
+    session_key: i64,
+    event: PollResult,
+    car_buf: &mut Vec<CarData>,
+    loc_buf: &mut Vec<Location>,
+    counts: &mut MessageCounts,
+    persist_high_rate: &Arc<AtomicBool>,
+    db: &Arc<Mutex<Db>>,
+    toasts: &Toasts,
+) {
+    match event {
+        Ok(Event::Incoming(Packet::Publish(publish))) => {
+            match publish.topic.as_str() {
+                "v1/car_data" => {
+                    counts.car_data += 1;
+                    if persist_high_rate.load(Ordering::Relaxed) {
+                        match serde_json::from_slice::<CarData>(&publish.payload) {
+                            Ok(d) => {
+                                if d.session_key == Some(session_key) {
+                                    car_buf.push(d);
+                                }
+                            }
+                            Err(e) => {
+                                counts.errors += 1;
+                                tracing::warn!(error = %e, "MQTT v1/car_data parse failed");
+                                push_toast(toasts, format!("MQTT v1/car_data: {e}"), true);
+                            }
+                        }
+                    }
+                }
+                "v1/location" => {
+                    counts.location += 1;
+                    if persist_high_rate.load(Ordering::Relaxed) {
+                        match serde_json::from_slice::<Location>(&publish.payload) {
+                            Ok(d) => {
+                                if d.session_key == Some(session_key) {
+                                    loc_buf.push(d);
+                                }
+                            }
+                            Err(e) => {
+                                counts.errors += 1;
+                                tracing::warn!(error = %e, "MQTT v1/location parse failed");
+                                push_toast(toasts, format!("MQTT v1/location: {e}"), true);
+                            }
+                        }
+                    }
+                }
+                other => {
+                    match other {
+                        "v1/laps" => counts.laps += 1,
+                        "v1/position" => counts.position += 1,
+                        "v1/intervals" => counts.intervals += 1,
+                        _ => counts.other += 1,
+                    }
+                    if let Err(e) = dispatch_message(
+                        session_key,
+                        other,
+                        &publish.payload,
+                        db,
+                    ) {
+                        counts.errors += 1;
+                        tracing::warn!(topic = other, error = %e, "MQTT dispatch failed");
+                        push_toast(toasts, format!("MQTT {other}: {e}"), true);
+                    }
+                }
+            }
+        }
+        Ok(Event::Incoming(Packet::ConnAck(_))) => {
+            tracing::info!(session_key, "MQTT ConnAck received");
+            push_toast(toasts, "MQTT connected".into(), false);
+        }
+        Ok(Event::Incoming(Packet::Disconnect)) => {
+            tracing::warn!(session_key, "MQTT broker sent Disconnect");
+        }
+        Err(e) => {
+            counts.errors += 1;
+            tracing::warn!(session_key, error = %e, "MQTT poll error (will reconnect)");
+            push_toast(toasts, format!("MQTT: {e}"), true);
+        }
+        _ => {}
     }
 }
 
@@ -203,8 +360,11 @@ fn flush_buffers(
         return;
     }
 
+    let car_n = car_buf.len();
+    let loc_n = loc_buf.len();
     let db = db.lock().unwrap();
     if let Err(e) = db.begin() {
+        tracing::error!(session_key, error = %e, "MQTT batch begin failed");
         push_toast(toasts, format!("MQTT batch begin: {e}"), true);
         car_buf.clear();
         loc_buf.clear();
@@ -213,14 +373,17 @@ fn flush_buffers(
     if !car_buf.is_empty()
         && let Err(e) = db.upsert_car_data(session_key, car_buf)
     {
+        tracing::error!(session_key, n = car_n, error = %e, "MQTT car_data flush failed");
         push_toast(toasts, format!("MQTT car_data flush: {e}"), true);
     }
     if !loc_buf.is_empty()
         && let Err(e) = db.upsert_location(session_key, loc_buf)
     {
+        tracing::error!(session_key, n = loc_n, error = %e, "MQTT location flush failed");
         push_toast(toasts, format!("MQTT location flush: {e}"), true);
     }
     if let Err(e) = db.commit() {
+        tracing::error!(session_key, error = %e, "MQTT batch commit failed");
         push_toast(toasts, format!("MQTT batch commit: {e}"), true);
     }
 
@@ -232,7 +395,20 @@ async fn get_token(client: &OpenF1Client) -> Option<String> {
     client.auth_manager()?.get_valid_token().await
 }
 
+/// Ensures a default rustls CryptoProvider is installed exactly once per process.
+/// rustls 0.23 panics at runtime if no provider is registered when ClientConfig
+/// is built without an explicit one.
+static CRYPTO_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 fn connect(token: &str) -> Result<(AsyncClient, rumqttc::EventLoop)> {
+    ensure_crypto_provider();
+
     let client_id = format!("f1-pitwall-{}", rand_suffix());
     let mut opts = MqttOptions::new(&client_id, BROKER_HOST, BROKER_PORT);
     opts.set_credentials("f1-pitwall", token);
@@ -241,9 +417,14 @@ fn connect(token: &str) -> Result<(AsyncClient, rumqttc::EventLoop)> {
 
     // TLS via rustls with system root certificates.
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs()
-        .map_err(|e| anyhow::anyhow!("failed to load native certs: {e}"))?
-    {
+    let cert_result = rustls_native_certs::load_native_certs();
+    for err in &cert_result.errors {
+        tracing::warn!(error = %err, "rustls-native-certs: error loading some certs");
+    }
+    if cert_result.certs.is_empty() {
+        return Err(anyhow::anyhow!("no native root certificates loaded"));
+    }
+    for cert in cert_result.certs {
         let _ = root_store.add(cert);
     }
     let tls_config = rustls::ClientConfig::builder()
