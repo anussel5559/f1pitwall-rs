@@ -24,6 +24,20 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         })
 }
 
+/// Parse "HH:MM:SS" gmt_offset string (from OpenF1 API) into a chrono FixedOffset.
+pub fn parse_gmt_offset(s: &str) -> Option<FixedOffset> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.len() >= 2 {
+        let hours: i32 = parts[0].parse().ok()?;
+        let mins: i32 = parts[1].parse().ok()?;
+        let sign = if hours < 0 { -1 } else { 1 };
+        let total_secs = hours * 3600 + sign * mins * 60;
+        FixedOffset::east_opt(total_secs)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod parse_ts_tests {
     use super::*;
@@ -46,19 +60,5 @@ mod parse_ts_tests {
     fn naive_iso_treated_as_utc() {
         let dt = parse_ts("2026-05-01T21:11:45.087000").unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-05-01T21:11:45.087+00:00");
-    }
-}
-
-/// Parse "HH:MM:SS" gmt_offset string (from OpenF1 API) into a chrono FixedOffset.
-pub fn parse_gmt_offset(s: &str) -> Option<FixedOffset> {
-    let parts: Vec<&str> = s.trim().split(':').collect();
-    if parts.len() >= 2 {
-        let hours: i32 = parts[0].parse().ok()?;
-        let mins: i32 = parts[1].parse().ok()?;
-        let sign = if hours < 0 { -1 } else { 1 };
-        let total_secs = hours * 3600 + sign * mins * 60;
-        FixedOffset::east_opt(total_secs)
-    } else {
-        None
     }
 }
