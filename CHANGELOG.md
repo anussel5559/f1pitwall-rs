@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.34.2
+
+- Fix every qualifying driver getting stuck on the "PIT" label (`crates/f1core/src/db/queries.rs`)
+  - Symptom from a live qualifying session: nearly every driver — including ones currently setting sectors — was rendered with the "PIT" status overlay on the leaderboard. The frontend reads `row.in_pit` and prefers it over every other state, so the bad flag effectively masked all other on-track states
+  - Root cause: 0.34.0 introduced a `qual_pit_status` CTE that aggregated **all** of a driver's `pit_stops` rows with `MAX(CASE WHEN ... lane_duration IS NULL ... THEN 1 ELSE 0 END)`. The intent was to mirror the race-side `pit_status` CTE, but the qualifying use case is materially different: drivers traverse the pit lane many times between hot laps, and OpenF1 commonly leaves `lane_duration` NULL on those qualifying traversal rows (it's primarily backfilled for race stops). With NULL `lane_duration` the `CASE` evaluates to 1, and `MAX` then locks `in_pit = 1` for the rest of the session — for every driver who'd ever entered the pit lane
+  - Fix: drop the `qual_pit_status` CTE entirely and reuse the existing `closed_in_laps` gate that `is_in_lap` already relies on. `in_pit` is now `1` iff the driver's current lap matches a confirmed in-lap (successor stint exists, or `pit_stops` row at the stint's `lap_end`) **and** that lap has finished by `clock_now`. Once the driver starts an out-lap (next stint), the cil join misses and `in_pit` clears — no more "stuck PIT" from stale NULL-lane_duration traversals. Same evidence threshold as `is_in_lap`, just additionally gated on lap completion so the label transitions IN → PIT at the moment the in-lap timer rolls over rather than at pit-entry
+  - Tests: 1 new regression test (`qualifying_in_pit_clears_after_out_lap_with_null_lane_duration`) covering the multi-traversal NULL `lane_duration` case; the existing `qualifying_in_pit_follows_pit_stops_timing` test continues to pass under the new gate
+
 ## 0.34.1
 
 - Fix qualifying leaderboard ordering of eliminated drivers (`crates/f1core/src/display.rs`)

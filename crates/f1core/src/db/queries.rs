@@ -384,19 +384,6 @@ impl Db {
                     )
                   )
              ),
-             qual_pit_status AS (
-                SELECT ps.driver_number,
-                    MAX(CASE
-                        WHEN ps.date IS NOT NULL
-                         AND datetime(ps.date) <= datetime(?2)
-                         AND (ps.lane_duration IS NULL
-                              OR datetime(ps.date, '+' || CAST(CAST(ps.lane_duration + 1 AS INTEGER) AS TEXT) || ' seconds') >= datetime(?2))
-                        THEN 1 ELSE 0
-                    END) as in_pit
-                FROM pit_stops ps
-                WHERE ps.session_key=?1
-                GROUP BY ps.driver_number
-             ),
              completed_laps AS (
                 SELECT l.*
                 FROM laps l
@@ -478,10 +465,15 @@ impl Db {
                 -- stint actually closed (see closed_in_laps CTE above).
                 CASE WHEN cil.driver_number IS NOT NULL
                      THEN 1 ELSE 0 END as is_in_lap,
-                -- in_pit follows pit_stops timing directly: the driver is
-                -- currently in the pit lane if their latest pit stop's
-                -- date..date+lane_duration window contains clock_now.
-                COALESCE(qps.in_pit, 0) as in_pit
+                -- in_pit reuses the closed_in_laps gate: the driver is in
+                -- the pit lane once a confirmed in-lap has finished. Avoids
+                -- aggregating over pit_stops with MAX(...), which fires
+                -- forever when older traversals have NULL lane_duration
+                -- (common for qualifying pit-lane visits in OpenF1 data).
+                CASE WHEN cil.driver_number IS NOT NULL
+                       AND l.lap_duration IS NOT NULL
+                       AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) + 1 AS TEXT) || ' seconds') <= datetime(?2)
+                     THEN 1 ELSE 0 END as in_pit
              FROM drivers d
              LEFT JOIN ranked_laps l ON l.driver_number=d.driver_number AND l.rn=1
              LEFT JOIN prev_non_outlap pnol ON pnol.driver_number=d.driver_number AND pnol.rn=1
@@ -491,7 +483,6 @@ impl Db {
              LEFT JOIN timed_lap_count tlc ON tlc.driver_number=d.driver_number
              LEFT JOIN closed_in_laps cil ON cil.driver_number=d.driver_number
                 AND cil.lap_number=l.lap_number
-             LEFT JOIN qual_pit_status qps ON qps.driver_number=d.driver_number
              WHERE d.session_key=?1
              ORDER BY bl.best_lap ASC NULLS LAST"
         )?;
@@ -1433,6 +1424,42 @@ mod tests {
             .unwrap();
         let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
         assert!(r.in_pit, "driver should still be in pit lane");
+    }
+
+    /// Regression: qualifying pit-lane traversals often arrive with
+    /// lane_duration=NULL in OpenF1 data. Once the driver is back out on a
+    /// new stint (out-lap of stint 2 in progress), in_pit must clear — not
+    /// stay stuck because an older pit_stops row had a NULL lane_duration.
+    #[test]
+    fn qualifying_in_pit_clears_after_out_lap_with_null_lane_duration() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
+        insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T10:02:45", 100.0, false); // in-lap
+        insert_lap(&db, 16, 4, "2026-05-01T10:04:25", 95.0, true); // out-lap of stint 2
+        insert_stint(&db, 16, 1, 1, 3);
+        insert_stint(&db, 16, 2, 4, 4); // successor stint → stint 1 closed
+
+        // Pit-lane traversal at lap 3 with NULL lane_duration.
+        db.conn
+            .execute(
+                "INSERT INTO pit_stops (session_key, driver_number, date, lap_number,                  stop_duration, lane_duration) VALUES (?1, ?2, ?3, ?4, 3.0, NULL)",
+                params![SK, 16, "2026-05-01T10:04:25", 3],
+            )
+            .unwrap();
+
+        // Clock is mid-out-lap (lap 4 in progress); driver is on track.
+        let rows = db
+            .get_qualifying_board_rows(SK, "2026-05-01T10:05:00", None)
+            .unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(4));
+        assert!(
+            !r.in_pit,
+            "driver on out-lap must not be flagged in_pit, even with NULL lane_duration on prior traversal"
+        );
+        assert!(r.is_pit_out_lap);
     }
 
     /// Race query mirrors the qualifying gate via the new is_in_lap field
