@@ -357,18 +357,57 @@ impl Db {
                 LEFT JOIN driver_max_lap dml ON dml.driver_number=s.driver_number
                 WHERE s.session_key=?1 AND s.lap_start <= COALESCE(dml.max_lap, 1)
              ),
+             -- A stint's lap_end is only a real in-lap once we have positive
+             -- evidence the stint actually closed: either a successor stint
+             -- exists, or a pit_stops row at that lap. Without this gate,
+             -- OpenF1's stints endpoint reports lap_end = the latest lap of
+             -- an open (live) stint, so every fresh lap of a live driver
+             -- looks like an in-lap.
+             closed_in_laps AS (
+                SELECT s.driver_number, s.lap_end as lap_number
+                FROM stints s
+                WHERE s.session_key=?1 AND s.lap_end IS NOT NULL
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM stints s2
+                        WHERE s2.session_key=s.session_key
+                          AND s2.driver_number=s.driver_number
+                          AND s2.stint_number > s.stint_number
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pit_stops ps
+                        WHERE ps.session_key=s.session_key
+                          AND ps.driver_number=s.driver_number
+                          AND ps.lap_number=s.lap_end
+                          AND ps.date IS NOT NULL
+                          AND datetime(ps.date) <= datetime(?2)
+                    )
+                  )
+             ),
+             qual_pit_status AS (
+                SELECT ps.driver_number,
+                    MAX(CASE
+                        WHEN ps.date IS NOT NULL
+                         AND datetime(ps.date) <= datetime(?2)
+                         AND (ps.lane_duration IS NULL
+                              OR datetime(ps.date, '+' || CAST(CAST(ps.lane_duration + 1 AS INTEGER) AS TEXT) || ' seconds') >= datetime(?2))
+                        THEN 1 ELSE 0
+                    END) as in_pit
+                FROM pit_stops ps
+                WHERE ps.session_key=?1
+                GROUP BY ps.driver_number
+             ),
              completed_laps AS (
                 SELECT l.*
                 FROM laps l
-                LEFT JOIN stints s ON s.session_key=l.session_key
-                  AND s.driver_number=l.driver_number
-                  AND l.lap_number BETWEEN s.lap_start AND s.lap_end
+                LEFT JOIN closed_in_laps cil ON cil.driver_number=l.driver_number
+                  AND cil.lap_number=l.lap_number
                 WHERE l.session_key=?1
                   AND l.date_start IS NOT NULL
                   AND (?3 IS NULL OR l.date_start >= ?3)
                   AND l.is_pit_out_lap=0 AND l.lap_duration IS NOT NULL AND l.lap_duration > 0
                   AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) + 1 AS TEXT) || ' seconds') <= datetime(?2)
-                  AND (s.lap_end IS NULL OR l.lap_number != s.lap_end)
+                  AND cil.driver_number IS NULL
              ),
              best_laps AS (
                 SELECT driver_number, MIN(lap_duration) as best_lap
@@ -395,14 +434,13 @@ impl Db {
                        ROW_NUMBER() OVER (PARTITION BY l2.driver_number ORDER BY l2.lap_number DESC) as rn
                 FROM laps l2
                 JOIN ranked_laps rl ON rl.driver_number=l2.driver_number AND rl.rn=1
-                LEFT JOIN stints s2 ON s2.session_key=l2.session_key
-                  AND s2.driver_number=l2.driver_number
-                  AND l2.lap_number BETWEEN s2.lap_start AND s2.lap_end
+                LEFT JOIN closed_in_laps cil2 ON cil2.driver_number=l2.driver_number
+                  AND cil2.lap_number=l2.lap_number
                 WHERE l2.session_key=?1
                   AND l2.date_start IS NOT NULL AND l2.date_start <= ?2
                   AND (?3 IS NULL OR l2.date_start >= ?3)
                   AND l2.is_pit_out_lap=0
-                  AND (s2.lap_end IS NULL OR l2.lap_number != s2.lap_end)
+                  AND cil2.driver_number IS NULL
                   AND l2.lap_number < rl.lap_number
              )
              SELECT
@@ -436,13 +474,14 @@ impl Db {
                            AND st.lap_start IS NOT NULL
                            AND l.lap_number = st.lap_start)
                      THEN 1 ELSE 0 END as is_pit_out_lap,
-                CASE WHEN l.lap_number IS NOT NULL AND st.lap_end IS NOT NULL
-                     AND l.lap_number = st.lap_end
+                -- Only flag is_in_lap when we have positive evidence the
+                -- stint actually closed (see closed_in_laps CTE above).
+                CASE WHEN cil.driver_number IS NOT NULL
                      THEN 1 ELSE 0 END as is_in_lap,
-                CASE WHEN l.lap_number IS NOT NULL AND l.lap_number = st.lap_end
-                     AND l.lap_duration IS NOT NULL
-                     AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) AS TEXT) || ' seconds') <= datetime(?2)
-                     THEN 1 ELSE 0 END as in_pit
+                -- in_pit follows pit_stops timing directly: the driver is
+                -- currently in the pit lane if their latest pit stop's
+                -- date..date+lane_duration window contains clock_now.
+                COALESCE(qps.in_pit, 0) as in_pit
              FROM drivers d
              LEFT JOIN ranked_laps l ON l.driver_number=d.driver_number AND l.rn=1
              LEFT JOIN prev_non_outlap pnol ON pnol.driver_number=d.driver_number AND pnol.rn=1
@@ -450,6 +489,9 @@ impl Db {
              LEFT JOIN best_laps bl ON bl.driver_number=d.driver_number
              LEFT JOIN pb_lap pb ON pb.driver_number=d.driver_number AND pb.rn=1
              LEFT JOIN timed_lap_count tlc ON tlc.driver_number=d.driver_number
+             LEFT JOIN closed_in_laps cil ON cil.driver_number=d.driver_number
+                AND cil.lap_number=l.lap_number
+             LEFT JOIN qual_pit_status qps ON qps.driver_number=d.driver_number
              WHERE d.session_key=?1
              ORDER BY bl.best_lap ASC NULLS LAST"
         )?;
@@ -516,6 +558,31 @@ impl Db {
                 FROM stints s
                 LEFT JOIN driver_max_lap dml ON dml.driver_number=s.driver_number
                 WHERE s.session_key=?1 AND s.lap_start <= COALESCE(dml.max_lap, 1)
+             ),
+             -- See get_qualifying_board_rows for the open-stint rationale:
+             -- only treat a stint's lap_end as a true in-lap once we have
+             -- positive evidence the stint closed (successor stint exists,
+             -- or pit_stops row at that lap).
+             closed_in_laps AS (
+                SELECT s.driver_number, s.lap_end as lap_number
+                FROM stints s
+                WHERE s.session_key=?1 AND s.lap_end IS NOT NULL
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM stints s2
+                        WHERE s2.session_key=s.session_key
+                          AND s2.driver_number=s.driver_number
+                          AND s2.stint_number > s.stint_number
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pit_stops ps
+                        WHERE ps.session_key=s.session_key
+                          AND ps.driver_number=s.driver_number
+                          AND ps.lap_number=s.lap_end
+                          AND ps.date IS NOT NULL
+                          AND datetime(ps.date) <= datetime(?2)
+                    )
+                  )
              ),
              pit_counts AS (
                 SELECT ps.driver_number, l2.lap_number, COUNT(*) as cnt
@@ -588,6 +655,7 @@ impl Db {
                 sg.position as grid_position,
                 CASE WHEN l.is_pit_out_lap = 1 THEN 1 ELSE 0 END as is_pit_out_lap,
                 st.lap_end as stint_lap_end,
+                CASE WHEN cil.driver_number IS NOT NULL THEN 1 ELSE 0 END as is_in_lap,
                 CASE WHEN sd.driver_number IS NOT NULL THEN 1 ELSE 0 END as stopped,
                 COALESCE(pst2.in_pit, 0) as in_pit,
                 COALESCE(lp.exit_confirmed, 0) as pit_exit_confirmed
@@ -603,6 +671,8 @@ impl Db {
              LEFT JOIN stopped_drivers sd ON sd.driver_number=d.driver_number
              LEFT JOIN pit_status pst2 ON pst2.driver_number=d.driver_number
              LEFT JOIN latest_pit lp ON lp.driver_number=d.driver_number
+             LEFT JOIN closed_in_laps cil ON cil.driver_number=d.driver_number
+                AND cil.lap_number=l.lap_number
              WHERE d.session_key=?1
              ORDER BY COALESCE(p.position, 99)"
         )?;
@@ -636,9 +706,10 @@ impl Db {
                     grid_position: row.get(23)?,
                     is_pit_out_lap: row.get::<_, i64>(24).unwrap_or(0) == 1,
                     stint_lap_end: row.get(25)?,
-                    stopped: row.get::<_, i64>(26).unwrap_or(0) > 0,
-                    in_pit: row.get::<_, i64>(27).unwrap_or(0) > 0,
-                    pit_exit_confirmed: row.get::<_, i64>(28).unwrap_or(0) > 0,
+                    is_in_lap: row.get::<_, i64>(26).unwrap_or(0) == 1,
+                    stopped: row.get::<_, i64>(27).unwrap_or(0) > 0,
+                    in_pit: row.get::<_, i64>(28).unwrap_or(0) > 0,
+                    pit_exit_confirmed: row.get::<_, i64>(29).unwrap_or(0) > 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1241,5 +1312,164 @@ impl Db {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Db;
+    use rusqlite::params;
+
+    const SK: i64 = 9999;
+
+    fn setup_driver(db: &Db, dn: i64) {
+        db.conn.execute(
+            "INSERT INTO drivers (session_key, driver_number, name_acronym, team_name, team_colour)              VALUES (?1, ?2, ?3, 'Team', 'FFFFFF')",
+            params![SK, dn, format!("D{}", dn)],
+        ).unwrap();
+    }
+
+    fn insert_lap(db: &Db, dn: i64, lap: i64, date_start: &str, duration: f64, is_pit_out: bool) {
+        db.conn.execute(
+            "INSERT INTO laps (session_key, driver_number, lap_number, lap_duration,              duration_sector_1, duration_sector_2, duration_sector_3, is_pit_out_lap, date_start)              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?7)",
+            params![SK, dn, lap, duration, duration / 3.0, is_pit_out as i64, date_start],
+        ).unwrap();
+    }
+
+    fn insert_stint(db: &Db, dn: i64, stint_no: i64, lap_start: i64, lap_end: i64) {
+        db.conn.execute(
+            "INSERT INTO stints (session_key, driver_number, stint_number, compound,              lap_start, lap_end, tyre_age_at_start)              VALUES (?1, ?2, ?3, 'SOFT', ?4, ?5, 0)",
+            params![SK, dn, stint_no, lap_start, lap_end],
+        ).unwrap();
+    }
+
+    fn insert_pit_stop(db: &Db, dn: i64, lap: i64, date: &str, lane_duration: f64) {
+        db.conn.execute(
+            "INSERT INTO pit_stops (session_key, driver_number, date, lap_number,              stop_duration, lane_duration)              VALUES (?1, ?2, ?3, ?4, 3.0, ?5)",
+            params![SK, dn, date, lap, lane_duration],
+        ).unwrap();
+    }
+
+    /// Open stint in a live session: lap_end advances to the latest completed
+    /// lap, but no successor stint nor pit_stops row exists yet. The lap must
+    /// NOT be flagged as is_in_lap.
+    #[test]
+    fn qualifying_open_stint_does_not_flag_in_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
+        insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
+        // Open stint: lap_end = 2 (latest completed lap), no successor, no pit stop.
+        insert_stint(&db, 16, 1, 1, 2);
+
+        let rows = db
+            .get_qualifying_board_rows(SK, "2026-05-01T10:03:00", None)
+            .unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(2));
+        assert!(!r.is_in_lap, "open-stint lap should not flag is_in_lap");
+        assert!(!r.in_pit, "open-stint lap should not flag in_pit");
+    }
+
+    /// A closed stint (successor exists) correctly flags the lap_end as in-lap.
+    #[test]
+    fn qualifying_closed_stint_via_successor_flags_in_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
+        insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T10:02:45", 100.0, false); // in-lap
+        insert_lap(&db, 16, 4, "2026-05-01T10:04:25", 95.0, true); // out-lap of stint 2
+        insert_stint(&db, 16, 1, 1, 3);
+        insert_stint(&db, 16, 2, 4, 4); // successor exists → stint 1 is closed
+
+        let rows = db
+            .get_qualifying_board_rows(SK, "2026-05-01T10:06:00", None)
+            .unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        // Latest lap = 4 (out-lap of stint 2), not an in-lap.
+        assert_eq!(r.lap_number, Some(4));
+        assert!(!r.is_in_lap);
+        assert!(r.is_pit_out_lap);
+    }
+
+    /// A pit_stops row at lap_end also closes the stint (pit entered, no
+    /// new stint reported yet).
+    #[test]
+    fn qualifying_closed_stint_via_pit_stop_flags_in_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
+        insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T10:02:45", 100.0, false); // in-lap
+        insert_stint(&db, 16, 1, 1, 3);
+        // Pit stop at lap 3 (the in-lap), well within clock_now's window.
+        insert_pit_stop(&db, 16, 3, "2026-05-01T10:04:25", 25.0);
+
+        let rows = db
+            .get_qualifying_board_rows(SK, "2026-05-01T10:04:30", None)
+            .unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(3));
+        assert!(r.is_in_lap, "pit-stop at lap_end should close the stint");
+    }
+
+    /// In-pit window: while the driver is still in the pit lane (pit_stops
+    /// date..date+lane_duration covers clock_now), in_pit must be true even
+    /// for an open stint.
+    #[test]
+    fn qualifying_in_pit_follows_pit_stops_timing() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
+        insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T10:02:45", 100.0, false);
+        insert_stint(&db, 16, 1, 1, 3);
+        insert_pit_stop(&db, 16, 3, "2026-05-01T10:04:25", 25.0);
+
+        // Clock is mid-pit-lane (date + 10s, well before date + 25s).
+        let rows = db
+            .get_qualifying_board_rows(SK, "2026-05-01T10:04:35", None)
+            .unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert!(r.in_pit, "driver should still be in pit lane");
+    }
+
+    /// Race query mirrors the qualifying gate via the new is_in_lap field
+    /// on BoardRow.
+    #[test]
+    fn race_open_stint_does_not_flag_in_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        // Open stint: lap_end advances live, no successor, no pit stop.
+        insert_stint(&db, 16, 1, 1, 2);
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:03:00").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(2));
+        assert!(
+            !r.is_in_lap,
+            "open-stint lap should not flag is_in_lap (race)"
+        );
+    }
+
+    #[test]
+    fn race_closed_stint_flags_in_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_stint(&db, 16, 1, 1, 2);
+        insert_pit_stop(&db, 16, 2, "2026-05-01T14:02:58", 25.0);
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:03:05").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(2));
+        assert!(
+            r.is_in_lap,
+            "pit-stop at lap_end should mark race lap as in-lap"
+        );
     }
 }
