@@ -1315,7 +1315,6 @@ impl Db {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
@@ -1330,14 +1329,7 @@ mod tests {
         ).unwrap();
     }
 
-    fn insert_lap(
-        db: &Db,
-        dn: i64,
-        lap: i64,
-        date_start: &str,
-        duration: f64,
-        is_pit_out: bool,
-    ) {
+    fn insert_lap(db: &Db, dn: i64, lap: i64, date_start: &str, duration: f64, is_pit_out: bool) {
         db.conn.execute(
             "INSERT INTO laps (session_key, driver_number, lap_number, lap_duration,              duration_sector_1, duration_sector_2, duration_sector_3, is_pit_out_lap, date_start)              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?7)",
             params![SK, dn, lap, duration, duration / 3.0, is_pit_out as i64, date_start],
@@ -1387,7 +1379,7 @@ mod tests {
         insert_lap(&db, 16, 1, "2026-05-01T10:00:00", 90.0, true);
         insert_lap(&db, 16, 2, "2026-05-01T10:01:30", 75.0, false);
         insert_lap(&db, 16, 3, "2026-05-01T10:02:45", 100.0, false); // in-lap
-        insert_lap(&db, 16, 4, "2026-05-01T10:04:25", 95.0, true);  // out-lap of stint 2
+        insert_lap(&db, 16, 4, "2026-05-01T10:04:25", 95.0, true); // out-lap of stint 2
         insert_stint(&db, 16, 1, 1, 3);
         insert_stint(&db, 16, 2, 4, 4); // successor exists → stint 1 is closed
 
@@ -1454,12 +1446,13 @@ mod tests {
         // Open stint: lap_end advances live, no successor, no pit stop.
         insert_stint(&db, 16, 1, 1, 2);
 
-        let rows = db
-            .get_race_board_rows(SK, "2026-05-01T14:03:00")
-            .unwrap();
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:03:00").unwrap();
         let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
         assert_eq!(r.lap_number, Some(2));
-        assert!(!r.is_in_lap, "open-stint lap should not flag is_in_lap (race)");
+        assert!(
+            !r.is_in_lap,
+            "open-stint lap should not flag is_in_lap (race)"
+        );
     }
 
     #[test]
@@ -1471,12 +1464,12 @@ mod tests {
         insert_stint(&db, 16, 1, 1, 2);
         insert_pit_stop(&db, 16, 2, "2026-05-01T14:02:58", 25.0);
 
-        let rows = db
-            .get_race_board_rows(SK, "2026-05-01T14:03:05")
-            .unwrap();
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:03:05").unwrap();
         let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
         assert_eq!(r.lap_number, Some(2));
-        assert!(r.is_in_lap, "pit-stop at lap_end should mark race lap as in-lap");
+        assert!(
+            r.is_in_lap,
+            "pit-stop at lap_end should mark race lap as in-lap"
+        );
     }
 }
-
