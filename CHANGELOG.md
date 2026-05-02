@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.34.1
+
+- Fix qualifying leaderboard ordering of eliminated drivers (`crates/f1core/src/display.rs`)
+  - Symptom: in qualifying sessions past Q1, drivers eliminated in Q2 were displayed in slots P16–P20 while drivers eliminated in Q1 were shown in P11–P15 — the inverse of correct order. A Q2-eliminated driver outranks a Q1-eliminated driver because they advanced through one more cut, so they should occupy P11–P15 (with Q1 eliminations in P16–P20)
+  - Root cause: `build_qualifying_rows` partitions eliminated drivers into a separate `elim_rows` block and sorts that block by the `knocked_out` string tag (`"Q1"` / `"Q2"`) before assigning positions sequentially after the active rows. The sort used `a.knocked_out.cmp(&b.knocked_out)`, and lexicographically `"Q1" < "Q2"`, so Q1 eliminations were placed first in the block and received the lower position numbers. The accompanying comment ("Q1 first, then Q2") matched the buggy implementation but not the F1 sporting reality
+  - Fix: swap to `b.knocked_out.cmp(&a.knocked_out)` so the most-recent elimination round sorts first within the block. The `.then_with(...)` lap-time tiebreaker is unchanged — within a single segment, faster best lap still ranks higher. No data-shape changes; purely a comparator flip plus an updated comment
+
 ## 0.34.0
 
 - Stop misclassifying live flying laps as in-laps (`crates/f1core/src/db/queries.rs`, `crates/f1core/src/db/models.rs`)
