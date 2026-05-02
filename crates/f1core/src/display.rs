@@ -177,10 +177,11 @@ pub fn build_qualifying_rows(
         }
     }
 
-    // Sort eliminated: Q1 first, then Q2, within each group by best_lap.
+    // Sort eliminated: Q2 first, then Q1 (later-eliminated ranks higher),
+    // within each group by best_lap.
     elim_rows.sort_by(|a, b| {
-        a.knocked_out
-            .cmp(&b.knocked_out)
+        b.knocked_out
+            .cmp(&a.knocked_out)
             .then_with(|| match (a.best_lap, b.best_lap) {
                 (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
