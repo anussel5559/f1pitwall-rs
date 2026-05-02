@@ -1,5 +1,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
+use crate::util::time::parse_ts;
+
 /// Tolerance for comparing floating-point sector times.
 const FLOAT_TOLERANCE: f64 = 0.001;
 
@@ -47,9 +49,14 @@ pub fn visible_sectors(
     s2: Option<f64>,
     s3: Option<f64>,
 ) -> (Option<f64>, Option<f64>, Option<f64>) {
-    let start = match lap_date_start.and_then(|d| d.parse::<DateTime<Utc>>().ok()) {
+    // Use the project-wide tolerant parser: OpenF1 writes `laps.date_start`
+    // without a timezone suffix, which `DateTime::<Utc>::from_str` rejects.
+    // Falling through to the "show all" branch on parse failure was the
+    // qualifying out-lap leak — every flying lap revealed in full the moment
+    // the clock crossed `date_start`.
+    let start = match lap_date_start.and_then(parse_ts) {
         Some(t) => t,
-        None => return (s1, s2, s3), // no date info, show all
+        None => return (s1, s2, s3), // genuinely no date info, show all
     };
 
     let s1_dur = match s1 {
@@ -80,4 +87,43 @@ pub fn visible_sectors(
     }
 
     (s1, s2, s3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// OpenF1's `laps.date_start` arrives without a timezone suffix. The old
+    /// `d.parse::<DateTime<Utc>>()` path rejected it and `visible_sectors`
+    /// fell into the "show all" branch — leaking the entire flying lap as
+    /// soon as the clock crossed `date_start`.
+    #[test]
+    fn naive_utc_date_start_gates_progressive_reveal() {
+        let lap_start = "2026-05-01T21:11:45.087000"; // no offset suffix
+        let s1 = Some(29.682);
+        let s2 = Some(33.433);
+        let s3 = Some(24.754);
+
+        // 8s into the lap — every sector should still be hidden.
+        let mid_s1 = Utc.with_ymd_and_hms(2026, 5, 1, 21, 11, 53).unwrap();
+        assert_eq!(
+            visible_sectors(mid_s1, Some(lap_start), s1, s2, s3),
+            (None, None, None)
+        );
+
+        // After s1 finishes, only s1 is visible.
+        let after_s1 = Utc.with_ymd_and_hms(2026, 5, 1, 21, 12, 16).unwrap();
+        assert_eq!(
+            visible_sectors(after_s1, Some(lap_start), s1, s2, s3),
+            (s1, None, None)
+        );
+
+        // After lap end, all three are visible.
+        let after_s3 = Utc.with_ymd_and_hms(2026, 5, 1, 21, 13, 14).unwrap();
+        assert_eq!(
+            visible_sectors(after_s3, Some(lap_start), s1, s2, s3),
+            (s1, s2, s3)
+        );
+    }
 }
