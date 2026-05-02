@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.34.0
+
+- Stop misclassifying live flying laps as in-laps (`crates/f1core/src/db/queries.rs`, `crates/f1core/src/db/models.rs`)
+  - Symptom from a live FP1 (Miami 2026): LEC was setting personal-best sectors and purple sector times but the on-track status indicator showed "IN" (in-lap) on every fresh lap. Same defect surfaces during any live session — it just hadn't been called out before because most users were on replays
+  - Root cause: `is_in_lap` (and `in_pit` in the qualifying/practice query) were computed by checking `laps.lap_number = stints.lap_end`. OpenF1's stints endpoint reports each stint's `lap_end` as "the latest completed lap of that stint" — for an *open* stint (one currently being run live), `lap_end` advances every time the driver crosses the line. So once the stints poll caught up, every fresh lap matched `lap_end` and was flagged as an in-lap. The same broken assumption was filtering laps out of `completed_laps` / `prev_non_outlap`, intermittently dropping live PB laps from best-lap calculations between the laps poll and the next stints poll
+  - Fix: introduce a `closed_in_laps` CTE in both `get_qualifying_board_rows` and `get_race_board_rows` that lists `(driver_number, lap_number)` pairs only for stints we have positive evidence have closed — either a successor stint exists for the same driver, or a `pit_stops` row sits at the stint's `lap_end` with `date <= clock_now`. `is_in_lap` is now `1` iff the current lap matches a row in `closed_in_laps`; everything else (live driver mid-stint, no matter how long the stint has been open) gets `is_in_lap = 0`. Same gate is applied to the `completed_laps` and `prev_non_outlap` filters so live PBs are no longer transiently dropped
+  - The qualifying/practice `in_pit` flag was rewritten to mirror the race query's `pit_status` CTE — it now follows `pit_stops.date .. date + lane_duration` directly instead of the broken `lap_number = lap_end` heuristic. A driver shows `in_pit = 1` exactly while their latest pit stop's pit-lane window contains `clock_now`
+  - `BoardRow` (race) gains a new `is_in_lap: bool` field, populated by the same gate; `crates/pitwall/src/board.rs` previously reimplemented this check locally with the same defect, and will be updated in a follow-up to consume the gated flag directly
+  - Live tradeoff: a real in-lap is now only flagged once we have hard evidence the stint closed (next stint reported, or pit-stops row landed). In practice this means the "IN" label appears the moment the pit-stops endpoint records pit-lane entry — typically a few seconds after the car crosses the timing line at pit entry, before the lap rolls over. The cool-down heuristic (`>4s` slack vs PB sector) absorbs the cruise window. We consciously prefer "FLYING/COOL until proven IN" over the previous "IN until proven otherwise"
+  - Tests: 6 new unit tests in `crates/f1core/src/db/queries.rs` covering open-stint suppression, successor-closed and pit-stop-closed stints, in-pit timing, and the parallel race-query gate
+
+
 ## 0.33.3
 
 - Bound MQTT zombie-connection retries to ~15 minutes of total silence before giving up (`crates/f1core/src/mqtt.rs`)

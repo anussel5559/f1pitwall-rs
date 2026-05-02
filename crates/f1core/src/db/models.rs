@@ -56,6 +56,7 @@ pub struct BoardRow {
     pub is_pit_out_lap: bool,
     #[allow(dead_code)]
     pub stint_lap_end: Option<i64>,
+    pub is_in_lap: bool,
     pub stopped: bool,
     pub in_pit: bool,
     pub pit_exit_confirmed: bool,
