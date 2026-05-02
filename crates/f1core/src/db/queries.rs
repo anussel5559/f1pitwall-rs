@@ -357,6 +357,17 @@ impl Db {
                 LEFT JOIN driver_max_lap dml ON dml.driver_number=s.driver_number
                 WHERE s.session_key=?1 AND s.lap_start <= COALESCE(dml.max_lap, 1)
              ),
+             -- Every stint's first lap is, by definition, an out lap. Use
+             -- this set everywhere we need to exclude out laps, instead of
+             -- trusting OpenF1's per-lap is_pit_out_lap flag (which is often
+             -- missing on fresh rows). Covers all stints, not just the most
+             -- recent one — so a stale out lap in a prior stint also gets
+             -- filtered from prev-lap fallbacks and best-lap aggregates.
+             out_lap_numbers AS (
+                SELECT driver_number, lap_start as lap_number
+                FROM stints
+                WHERE session_key=?1 AND lap_start IS NOT NULL
+             ),
              -- A stint's lap_end is only a real in-lap once we have positive
              -- evidence the stint actually closed: either a successor stint
              -- exists, or a pit_stops row at that lap. Without this gate,
@@ -389,12 +400,15 @@ impl Db {
                 FROM laps l
                 LEFT JOIN closed_in_laps cil ON cil.driver_number=l.driver_number
                   AND cil.lap_number=l.lap_number
+                LEFT JOIN out_lap_numbers oln ON oln.driver_number=l.driver_number
+                  AND oln.lap_number=l.lap_number
                 WHERE l.session_key=?1
                   AND l.date_start IS NOT NULL
                   AND (?3 IS NULL OR l.date_start >= ?3)
                   AND l.is_pit_out_lap=0 AND l.lap_duration IS NOT NULL AND l.lap_duration > 0
                   AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) + 1 AS TEXT) || ' seconds') <= datetime(?2)
                   AND cil.driver_number IS NULL
+                  AND oln.driver_number IS NULL
              ),
              best_laps AS (
                 SELECT driver_number, MIN(lap_duration) as best_lap
@@ -423,11 +437,14 @@ impl Db {
                 JOIN ranked_laps rl ON rl.driver_number=l2.driver_number AND rl.rn=1
                 LEFT JOIN closed_in_laps cil2 ON cil2.driver_number=l2.driver_number
                   AND cil2.lap_number=l2.lap_number
+                LEFT JOIN out_lap_numbers oln2 ON oln2.driver_number=l2.driver_number
+                  AND oln2.lap_number=l2.lap_number
                 WHERE l2.session_key=?1
                   AND l2.date_start IS NOT NULL AND l2.date_start <= ?2
                   AND (?3 IS NULL OR l2.date_start >= ?3)
                   AND l2.is_pit_out_lap=0
                   AND cil2.driver_number IS NULL
+                  AND oln2.driver_number IS NULL
                   AND l2.lap_number < rl.lap_number
              )
              SELECT
@@ -453,13 +470,13 @@ impl Db {
                 COALESCE(st.compound, '') as compound,
                 COALESCE(st.tyre_age_at_start, 0) + MAX(COALESCE(l.lap_number, 0) - COALESCE(st.lap_start, 0), 0) as tyre_age,
                 COALESCE(tlc.cnt, 0) as lap_count,
-                -- Out-lap = first lap of the current stint. Trust the stint
-                -- boundary over the API flag (which is sometimes missing on
-                -- freshly-polled lap rows early in a session).
+                -- Out-lap = first lap of any stint. Trust the stint boundary
+                -- over the API flag (which is sometimes missing on freshly-
+                -- polled lap rows early in a session). Joining on
+                -- out_lap_numbers checks against ALL stints, not just the
+                -- most-recent one, matching the set used by prev_non_outlap.
                 CASE WHEN (l.is_pit_out_lap = 1)
-                       OR (l.lap_number IS NOT NULL
-                           AND st.lap_start IS NOT NULL
-                           AND l.lap_number = st.lap_start)
+                       OR oln_cur.driver_number IS NOT NULL
                      THEN 1 ELSE 0 END as is_pit_out_lap,
                 -- Only flag is_in_lap when we have positive evidence the
                 -- stint actually closed (see closed_in_laps CTE above).
@@ -483,6 +500,8 @@ impl Db {
              LEFT JOIN timed_lap_count tlc ON tlc.driver_number=d.driver_number
              LEFT JOIN closed_in_laps cil ON cil.driver_number=d.driver_number
                 AND cil.lap_number=l.lap_number
+             LEFT JOIN out_lap_numbers oln_cur ON oln_cur.driver_number=d.driver_number
+                AND oln_cur.lap_number=l.lap_number
              WHERE d.session_key=?1
              ORDER BY bl.best_lap ASC NULLS LAST"
         )?;
