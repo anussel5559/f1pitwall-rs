@@ -1,6 +1,7 @@
 {
   "rotation": 62,
   "race_laps": 70,
+  "sprint_laps": 24,
   "length_km": 4.361,
   "qualifying_record": {
     "time_s": 70.764,

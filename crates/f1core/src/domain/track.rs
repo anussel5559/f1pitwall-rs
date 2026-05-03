@@ -85,6 +85,10 @@ pub struct TrackOutline {
     /// Scheduled race distance in laps. Sourced from FIA-published figures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub race_laps: Option<i64>,
+    /// Scheduled sprint distance in laps. Only populated for circuits on the
+    /// current sprint calendar; `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint_laps: Option<i64>,
     /// Circuit length in kilometres. Sourced from FIA-published figures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_km: Option<f64>,
@@ -154,6 +158,8 @@ struct TrackFile {
     #[serde(default)]
     race_laps: Option<i64>,
     #[serde(default)]
+    sprint_laps: Option<i64>,
+    #[serde(default)]
     length_km: Option<f64>,
     #[serde(default)]
     qualifying_record: Option<QualifyingRecord>,
@@ -180,6 +186,7 @@ static TRACK_DATA: LazyLock<HashMap<String, TrackOutline>> = LazyLock::new(|| {
             points: parsed.points.into_iter().map(|[x, y]| (x, y)).collect(),
             turns: parsed.turns,
             race_laps: parsed.race_laps,
+            sprint_laps: parsed.sprint_laps,
             length_km: parsed.length_km,
             qualifying_record: parsed.qualifying_record,
             race_lap_record: parsed.race_lap_record,
