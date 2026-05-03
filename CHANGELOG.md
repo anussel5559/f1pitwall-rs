@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.35.0
+
+- Add `sprint_laps` to `TrackOutline` so consumers can render the correct scheduled distance for sprint sessions (`crates/f1core/src/domain/track.rs`, `data/tracks/{shanghai,miami,montreal,silverstone,zandvoort,marina_bay}.json`)
+  - Symptom: downstream consumers reading `TrackOutline.race_laps` had no way to distinguish the sprint distance from the main race distance, and were displaying e.g. Shanghai's 56-lap race distance during the 19-lap sprint
+  - The new `sprint_laps: Option<i64>` is populated only for circuits on the 2026 sprint calendar — Shanghai (19), Miami (19), Montreal (24), Silverstone (17), Zandvoort (24), Marina Bay (21). Non-sprint circuits leave the field `None`. Field is `#[serde(skip_serializing_if = "Option::is_none")]` so the public JSON shape is unchanged for non-sprint tracks
+  - Lap counts: Shanghai/Miami/Silverstone use historical sprint distances. Montreal/Zandvoort/Marina Bay are new sprint venues for 2026 — values are sized to ~100 km per FIA sprint format and may need tightening once the FIA publishes official figures
+  - Consumers should branch on session type when picking the lap total; `race_laps` remains the source of truth for non-sprint sessions
+
 ## 0.34.4
 
 - Fix qualifying flying laps revealing in full the moment they start (`crates/f1core/src/domain/sector.rs`, `crates/f1core/src/util/time.rs`)
