@@ -545,16 +545,20 @@ impl Db {
     }
 
     fn get_race_board_rows(&self, session_key: i64, clock_now: &str) -> Result<Vec<BoardRow>> {
+        // Positions and intervals are written at multi-Hz × ~20 drivers, so a
+        // long replay can accumulate tens to hundreds of thousands of rows per
+        // table. The previous shape (`ROW_NUMBER() OVER (PARTITION BY
+        // driver_number ORDER BY date DESC)` filtered to `rn=1`) had to scan
+        // and sort every row up to `clock_now` on every snapshot tick, making
+        // per-tick build time grow linearly with replay duration. The outer
+        // query only reads each driver's latest row, so we use a correlated
+        // `MAX(date)` lookup against the `(session_key, driver_number, date)`
+        // PK index — ~20 O(log N) seeks per tick instead of an O(N) scan +
+        // window sort. NULL-date rows are no longer returned (the original
+        // `(date IS NULL OR date <= ?2)` was defensive — OpenF1 always
+        // populates `date` on positions/intervals, and the PK includes it).
         let mut stmt = self.conn.prepare(
-            "WITH ranked_positions AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY driver_number ORDER BY date DESC) as rn
-                FROM positions WHERE session_key=?1 AND (date IS NULL OR date <= ?2)
-             ),
-             ranked_intervals AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY driver_number ORDER BY date DESC) as rn
-                FROM intervals WHERE session_key=?1 AND (date IS NULL OR date <= ?2)
-             ),
-             ranked_laps AS (
+            "WITH ranked_laps AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY driver_number ORDER BY lap_number DESC) as rn
                 FROM laps WHERE session_key=?1 AND date_start IS NOT NULL AND date_start <= ?2
              ),
@@ -670,8 +674,22 @@ impl Db {
                 COALESCE(pst2.in_pit, 0) as in_pit,
                 COALESCE(lp.exit_confirmed, 0) as pit_exit_confirmed
              FROM drivers d
-             LEFT JOIN ranked_positions p ON p.driver_number=d.driver_number AND p.rn=1
-             LEFT JOIN ranked_intervals i ON i.driver_number=d.driver_number AND i.rn=1
+             LEFT JOIN positions p ON p.session_key=d.session_key
+                AND p.driver_number=d.driver_number
+                AND p.date = (
+                    SELECT MAX(p2.date) FROM positions p2
+                    WHERE p2.session_key=d.session_key
+                      AND p2.driver_number=d.driver_number
+                      AND p2.date IS NOT NULL AND p2.date <= ?2
+                )
+             LEFT JOIN intervals i ON i.session_key=d.session_key
+                AND i.driver_number=d.driver_number
+                AND i.date = (
+                    SELECT MAX(i2.date) FROM intervals i2
+                    WHERE i2.session_key=d.session_key
+                      AND i2.driver_number=d.driver_number
+                      AND i2.date IS NOT NULL AND i2.date <= ?2
+                )
              LEFT JOIN ranked_laps l ON l.driver_number=d.driver_number AND l.rn=1
              LEFT JOIN ranked_laps pl ON pl.driver_number=d.driver_number AND pl.rn=2
              LEFT JOIN ranked_stints st ON st.driver_number=d.driver_number AND st.rn=1
@@ -735,31 +753,45 @@ impl Db {
         clock_now: &str,
         max_entries: i64,
     ) -> Result<std::collections::HashMap<i64, Vec<f64>>> {
-        let mut stmt = self.conn.prepare(
-            "WITH ranked AS (
-                SELECT driver_number, interval,
-                       ROW_NUMBER() OVER (PARTITION BY driver_number ORDER BY date DESC) as rn
-                FROM intervals
-                WHERE session_key = ?1
-                  AND date IS NOT NULL AND date <= ?2
-                  AND interval IS NOT NULL AND interval != ''
-             )
-             SELECT driver_number, interval
-             FROM ranked WHERE rn <= ?3
-             ORDER BY driver_number, rn DESC",
-        )?;
-        let rows = stmt
-            .query_map(params![session_key, clock_now, max_entries], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
+        // Previously this scanned every `intervals` row up to `clock_now`,
+        // PARTITION+sorted by date DESC, then kept `rn <= max_entries` — O(N)
+        // per snapshot tick where N grows linearly with replay duration.
+        // Replaced with a per-driver `ORDER BY date DESC LIMIT ?` over the
+        // `(session_key, driver_number, date)` PK index, so each driver costs
+        // O(log N + max_entries) regardless of how much history exists.
+        let mut driver_stmt = self
+            .conn
+            .prepare("SELECT driver_number FROM drivers WHERE session_key=?1")?;
+        let drivers: Vec<i64> = driver_stmt
+            .query_map(params![session_key], |row| row.get::<_, i64>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let mut interval_stmt = self.conn.prepare(
+            "SELECT interval FROM intervals
+             WHERE session_key = ?1
+               AND driver_number = ?2
+               AND date IS NOT NULL AND date <= ?3
+               AND interval IS NOT NULL AND interval != ''
+             ORDER BY date DESC
+             LIMIT ?4",
+        )?;
+
         let mut result: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
-        for (driver_number, interval_str) in rows {
-            if let Some(val) = crate::domain::battle::parse_interval(&interval_str)
-                && val > 0.0
-            {
-                result.entry(driver_number).or_default().push(val);
+        for driver_number in drivers {
+            let rows = interval_stmt
+                .query_map(
+                    params![session_key, driver_number, clock_now, max_entries],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // Query returns newest-first; flip to chronological to match the
+            // previous `ORDER BY driver_number, rn DESC` output shape.
+            for interval_str in rows.into_iter().rev() {
+                if let Some(val) = crate::domain::battle::parse_interval(&interval_str)
+                    && val > 0.0
+                {
+                    result.entry(driver_number).or_default().push(val);
+                }
             }
         }
         Ok(result)
@@ -1517,5 +1549,90 @@ mod tests {
             r.is_in_lap,
             "pit-stop at lap_end should mark race lap as in-lap"
         );
+    }
+
+    fn insert_position(db: &Db, dn: i64, position: i64, date: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO positions (session_key, driver_number, position, date) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![SK, dn, position, date],
+            )
+            .unwrap();
+    }
+
+    fn insert_interval(db: &Db, dn: i64, gap_to_leader: &str, interval: &str, date: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO intervals (session_key, driver_number, gap_to_leader, interval, date) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![SK, dn, gap_to_leader, interval, date],
+            )
+            .unwrap();
+    }
+
+    /// Pins the per-driver latest-row behavior of the rewritten positions /
+    /// intervals lookups. Two rows per driver with different dates: only the
+    /// most-recent row whose date is `<= clock_now` should surface. Catches a
+    /// regression to the old O(N) PARTITION-by-row_number form *and* any
+    /// mistake in the correlated `MAX(date)` join that would pick the wrong
+    /// row.
+    #[test]
+    fn race_board_picks_latest_position_and_interval_per_driver() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        // Older then newer; clock_now is past both so the latest should win.
+        insert_position(&db, 16, 5, "2026-05-01T14:00:00");
+        insert_position(&db, 16, 3, "2026-05-01T14:01:00");
+        insert_interval(&db, 16, "+10.0", "+1.5", "2026-05-01T14:00:00");
+        insert_interval(&db, 16, "+12.3", "+2.1", "2026-05-01T14:01:00");
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:02:00").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.position, 3, "must use the latest positions row");
+        assert_eq!(r.gap, "+12.3", "must use the latest intervals row");
+        assert_eq!(r.interval, "+2.1");
+    }
+
+    /// `clock_now` between the two rows must surface the *older* row — the
+    /// newer one is in the replay future. Guards the `date <= clock_now`
+    /// bound in the correlated subquery.
+    #[test]
+    fn race_board_excludes_position_rows_in_replay_future() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_position(&db, 16, 5, "2026-05-01T14:00:00");
+        insert_position(&db, 16, 3, "2026-05-01T14:01:00");
+        insert_interval(&db, 16, "+10.0", "+1.5", "2026-05-01T14:00:00");
+        insert_interval(&db, 16, "+12.3", "+2.1", "2026-05-01T14:01:00");
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:00:30").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.position, 5);
+        assert_eq!(r.gap, "+10.0");
+        assert_eq!(r.interval, "+1.5");
+    }
+
+    /// `get_interval_history` returns up to `max_entries` per driver in
+    /// chronological order. With 5 rows and limit 3, the result is the 3
+    /// newest values in oldest-first order. Pins the per-driver `ORDER BY
+    /// date DESC LIMIT ?` + reverse that replaced the old PARTITION+rn shape.
+    #[test]
+    fn interval_history_returns_latest_n_chronological() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        for (i, sec) in [10, 20, 30, 40, 50].iter().enumerate() {
+            let date = format!("2026-05-01T14:00:{:02}", sec);
+            insert_interval(&db, 16, "+0.0", &format!("+{}.0", i + 1), &date);
+        }
+        // Add a future row that must NOT appear.
+        insert_interval(&db, 16, "+0.0", "+99.0", "2026-05-01T14:01:00");
+
+        let hist = db
+            .get_interval_history(SK, "2026-05-01T14:00:55", 3)
+            .unwrap();
+        let series = hist.get(&16).expect("driver 16 must be present");
+        // Latest 3 (sec=30,40,50 → values +3.0, +4.0, +5.0), chronological.
+        assert_eq!(series, &vec![3.0, 4.0, 5.0]);
     }
 }
