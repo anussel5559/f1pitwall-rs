@@ -545,39 +545,35 @@ impl Db {
     }
 
     fn get_race_board_rows(&self, session_key: i64, clock_now: &str) -> Result<Vec<BoardRow>> {
-        // Positions and intervals are written at multi-Hz × ~20 drivers, so a
-        // long replay can accumulate tens to hundreds of thousands of rows per
-        // table. The previous shape (`ROW_NUMBER() OVER (PARTITION BY
-        // driver_number ORDER BY date DESC)` filtered to `rn=1`) had to scan
-        // and sort every row up to `clock_now` on every snapshot tick, making
-        // per-tick build time grow linearly with replay duration. The outer
-        // query only reads each driver's latest row, so we use a correlated
-        // `MAX(date)` lookup against the `(session_key, driver_number, date)`
-        // PK index — ~20 O(log N) seeks per tick instead of an O(N) scan +
-        // window sort. NULL-date rows are no longer returned (the original
-        // `(date IS NULL OR date <= ?2)` was defensive — OpenF1 always
-        // populates `date` on positions/intervals, and the PK includes it).
+        // Per-driver index-seek pattern. The previous shape used PARTITION BY
+        // / ROW_NUMBER over the full per-session filtered set of `positions`,
+        // `intervals`, `laps`, and `stints`, then discarded all but the
+        // latest one or two rows per driver. That made per-tick build time
+        // grow linearly with replay duration — `laps` and `stints` were the
+        // remaining contributors after 0.35.1 handled positions/intervals.
+        // Now each table is read via a correlated `MAX(...)` lookup against
+        // its `(session_key, driver_number, …)` PK, which SQLite resolves as
+        // an O(log N) index seek per driver. The CTEs that *did* feed the
+        // outer query (closed_in_laps, stopped_drivers, pit_status,
+        // latest_pit) all scan small tables (`stints`, `race_control`,
+        // `pit_stops`) and stay as-is for now.
+        //
+        // Behavior trade notes:
+        //  * `laps` rows where `date_start IS NULL` are still dropped (same
+        //    as the previous `ranked_laps` CTE filter).
+        //  * The stint join inlines the per-driver `MAX(lap_number)` gate
+        //    that the old `driver_max_lap` CTE provided: a stint surfaces
+        //    only once `lap_start <= driver's latest completed lap` (or 1
+        //    when no laps have started yet). Prevents future stints, which
+        //    the replay bootstrap pre-loads, from leaking into the snapshot.
+        //  * `pit_count` becomes a scalar `COUNT(*)` subquery using the
+        //    latest lap's number directly, dropping the `pit_counts` CTE.
         let mut stmt = self.conn.prepare(
-            "WITH ranked_laps AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY driver_number ORDER BY lap_number DESC) as rn
-                FROM laps WHERE session_key=?1 AND date_start IS NOT NULL AND date_start <= ?2
-             ),
-             driver_max_lap AS (
-                SELECT driver_number, COALESCE(MAX(lap_number), 1) as max_lap
-                FROM laps WHERE session_key=?1 AND date_start IS NOT NULL AND date_start <= ?2
-                GROUP BY driver_number
-             ),
-             ranked_stints AS (
-                SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.driver_number ORDER BY s.stint_number DESC) as rn
-                FROM stints s
-                LEFT JOIN driver_max_lap dml ON dml.driver_number=s.driver_number
-                WHERE s.session_key=?1 AND s.lap_start <= COALESCE(dml.max_lap, 1)
-             ),
-             -- See get_qualifying_board_rows for the open-stint rationale:
-             -- only treat a stint's lap_end as a true in-lap once we have
-             -- positive evidence the stint closed (successor stint exists,
-             -- or pit_stops row at that lap).
-             closed_in_laps AS (
+            "WITH closed_in_laps AS (
+                -- See get_qualifying_board_rows for the open-stint
+                -- rationale: only treat a stint's lap_end as a true in-lap
+                -- once we have positive evidence the stint closed (successor
+                -- stint exists, or pit_stops row at that lap).
                 SELECT s.driver_number, s.lap_end as lap_number
                 FROM stints s
                 WHERE s.session_key=?1 AND s.lap_end IS NOT NULL
@@ -597,14 +593,6 @@ impl Db {
                           AND datetime(ps.date) <= datetime(?2)
                     )
                   )
-             ),
-             pit_counts AS (
-                SELECT ps.driver_number, l2.lap_number, COUNT(*) as cnt
-                FROM pit_stops ps
-                JOIN ranked_laps l2 ON l2.driver_number=ps.driver_number AND l2.rn=1
-                WHERE ps.session_key=?1 AND l2.lap_number IS NOT NULL
-                  AND ps.lap_number < l2.lap_number
-                GROUP BY ps.driver_number
              ),
              stopped_drivers AS (
                 SELECT driver_number
@@ -665,7 +653,12 @@ impl Db {
                 COALESCE(st.tyre_age_at_start, 0) + MAX(COALESCE(l.lap_number, 0) - COALESCE(st.lap_start, 0), 0) as tyre_age,
                 COALESCE(pst.compound, '') as prev_compound,
                 COALESCE(pst.tyre_age_at_start, 0) + MAX(COALESCE(pst.lap_end, pst.lap_start, 0) - COALESCE(pst.lap_start, 0), 0) as prev_tyre_age,
-                COALESCE(pc.cnt, 0) as pit_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM pit_stops ps
+                    WHERE ps.session_key=d.session_key
+                      AND ps.driver_number=d.driver_number
+                      AND ps.lap_number < l.lap_number
+                ), 0) as pit_count,
                 sg.position as grid_position,
                 CASE WHEN l.is_pit_out_lap = 1 THEN 1 ELSE 0 END as is_pit_out_lap,
                 st.lap_end as stint_lap_end,
@@ -690,12 +683,41 @@ impl Db {
                       AND i2.driver_number=d.driver_number
                       AND i2.date IS NOT NULL AND i2.date <= ?2
                 )
-             LEFT JOIN ranked_laps l ON l.driver_number=d.driver_number AND l.rn=1
-             LEFT JOIN ranked_laps pl ON pl.driver_number=d.driver_number AND pl.rn=2
-             LEFT JOIN ranked_stints st ON st.driver_number=d.driver_number AND st.rn=1
-             LEFT JOIN ranked_stints pst ON pst.driver_number=d.driver_number AND pst.rn=2
+             LEFT JOIN laps l ON l.session_key=d.session_key
+                AND l.driver_number=d.driver_number
+                AND l.lap_number = (
+                    SELECT MAX(l2.lap_number) FROM laps l2
+                    WHERE l2.session_key=d.session_key
+                      AND l2.driver_number=d.driver_number
+                      AND l2.date_start IS NOT NULL AND l2.date_start <= ?2
+                )
+             LEFT JOIN laps pl ON pl.session_key=d.session_key
+                AND pl.driver_number=d.driver_number
+                AND pl.lap_number = (
+                    SELECT MAX(l3.lap_number) FROM laps l3
+                    WHERE l3.session_key=d.session_key
+                      AND l3.driver_number=d.driver_number
+                      AND l3.date_start IS NOT NULL AND l3.date_start <= ?2
+                      AND l3.lap_number < l.lap_number
+                )
+             LEFT JOIN stints st ON st.session_key=d.session_key
+                AND st.driver_number=d.driver_number
+                AND st.stint_number = (
+                    SELECT MAX(s2.stint_number) FROM stints s2
+                    WHERE s2.session_key=d.session_key
+                      AND s2.driver_number=d.driver_number
+                      AND s2.lap_start <= COALESCE(l.lap_number, 1)
+                )
+             LEFT JOIN stints pst ON pst.session_key=d.session_key
+                AND pst.driver_number=d.driver_number
+                AND pst.stint_number = (
+                    SELECT MAX(s3.stint_number) FROM stints s3
+                    WHERE s3.session_key=d.session_key
+                      AND s3.driver_number=d.driver_number
+                      AND s3.lap_start <= COALESCE(l.lap_number, 1)
+                      AND s3.stint_number < st.stint_number
+                )
              LEFT JOIN starting_grid sg ON sg.session_key=d.session_key AND sg.driver_number=d.driver_number
-             LEFT JOIN pit_counts pc ON pc.driver_number=d.driver_number
              LEFT JOIN stopped_drivers sd ON sd.driver_number=d.driver_number
              LEFT JOIN pit_status pst2 ON pst2.driver_number=d.driver_number
              LEFT JOIN latest_pit lp ON lp.driver_number=d.driver_number
@@ -1634,5 +1656,114 @@ mod tests {
         let series = hist.get(&16).expect("driver 16 must be present");
         // Latest 3 (sec=30,40,50 → values +3.0, +4.0, +5.0), chronological.
         assert_eq!(series, &vec![3.0, 4.0, 5.0]);
+    }
+
+    /// Pins the per-driver latest/prev lap behavior of the rewritten `laps`
+    /// joins. Three completed laps: latest is lap 3, prev is lap 2. Catches
+    /// any mistake in the correlated `MAX(lap_number)` lookup or in the
+    /// `lap_number < l.lap_number` guard for the prev join.
+    #[test]
+    fn race_board_picks_latest_and_prev_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T14:02:58", 87.0, false);
+        insert_stint(&db, 16, 1, 1, 3);
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:05:00").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(3));
+        assert_eq!(r.last_lap, Some(87.0));
+        assert_eq!(r.prev_lap_number, Some(2));
+        assert_eq!(r.prev_last_lap, Some(88.0));
+    }
+
+    /// Future laps the replay bootstrap pre-loaded must not surface: with
+    /// `clock_now` mid-lap-2, the latest visible lap is 1 and there is no
+    /// prev. Guards the `date_start <= ?2` bound on both lap subqueries.
+    #[test]
+    fn race_board_excludes_lap_rows_in_replay_future() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T14:02:58", 87.0, false);
+        insert_stint(&db, 16, 1, 1, 3);
+
+        // Clock between lap 1 and lap 2 — only lap 1 should be visible.
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:00:45").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(1));
+        assert_eq!(r.prev_lap_number, None);
+    }
+
+    /// Two stints, two completed laps each. With `clock_now` mid-lap-5
+    /// (during stint 2), the latest stint is 2 and prev is 1. Guards the
+    /// `s.lap_start <= COALESCE(l.lap_number, 1)` gate that replaced the
+    /// `driver_max_lap` CTE — without it, a future stint would leak in.
+    #[test]
+    fn race_board_picks_latest_and_prev_stint() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T14:02:58", 87.0, false);
+        insert_lap(&db, 16, 4, "2026-05-01T14:04:25", 95.0, true); // out-lap of stint 2
+        insert_lap(&db, 16, 5, "2026-05-01T14:06:00", 86.0, false);
+        insert_stint(&db, 16, 1, 1, 3);
+        insert_stint(&db, 16, 2, 4, 5);
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:07:30").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(5));
+        assert_eq!(r.stint_lap_end, Some(5));
+        assert_eq!(r.prev_compound, "SOFT");
+        // Stint 1 spanned laps 1..=3, so its prev_tyre_age = lap_end - lap_start = 2.
+        assert_eq!(r.prev_tyre_age, Some(2));
+    }
+
+    /// A future stint pre-loaded by the replay bootstrap must not surface as
+    /// the current stint when `clock_now` is still inside the earlier stint.
+    /// Driver has laps only up to 2 by `clock_now`; the lap_start=4 stint
+    /// must not match.
+    #[test]
+    fn race_board_excludes_future_stints() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T14:02:58", 87.0, false);
+        insert_lap(&db, 16, 4, "2026-05-01T14:04:25", 95.0, true);
+        insert_stint(&db, 16, 1, 1, 3);
+        insert_stint(&db, 16, 2, 4, 4);
+
+        // Clock between lap 2 and lap 3: max visible lap = 2, so stint 2
+        // (lap_start=4) must NOT be selected.
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:02:00").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.lap_number, Some(2));
+        assert_eq!(r.stint_lap_end, Some(3), "must still be on stint 1");
+    }
+
+    /// `pit_count` reflects pit stops at laps strictly less than the
+    /// driver's latest lap. Guards the inline `COUNT(*)` subquery that
+    /// replaced the `pit_counts` CTE.
+    #[test]
+    fn race_board_pit_count_excludes_current_lap() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 16);
+        insert_lap(&db, 16, 1, "2026-05-01T14:00:00", 90.0, false);
+        insert_lap(&db, 16, 2, "2026-05-01T14:01:30", 88.0, false);
+        insert_lap(&db, 16, 3, "2026-05-01T14:02:58", 87.0, false);
+        insert_stint(&db, 16, 1, 1, 3);
+        // Two prior pit stops + one at the current lap (must be excluded).
+        insert_pit_stop(&db, 16, 1, "2026-05-01T14:00:30", 25.0);
+        insert_pit_stop(&db, 16, 2, "2026-05-01T14:01:55", 24.0);
+        insert_pit_stop(&db, 16, 3, "2026-05-01T14:03:20", 25.0);
+
+        let rows = db.get_race_board_rows(SK, "2026-05-01T14:05:00").unwrap();
+        let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
+        assert_eq!(r.pit_count, 2, "current lap's pit stop must not be counted");
     }
 }
