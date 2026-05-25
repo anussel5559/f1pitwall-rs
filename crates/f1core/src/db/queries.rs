@@ -1009,7 +1009,7 @@ impl Db {
         clock_now: &str,
     ) -> Result<Vec<RaceControlMsg>> {
         let mut stmt = self.conn.prepare(
-            "SELECT COALESCE(date,''), COALESCE(flag,''), COALESCE(message,''), lap_number
+            "SELECT COALESCE(date,''), COALESCE(category,''), COALESCE(flag,''), COALESCE(message,''), lap_number
              FROM race_control WHERE session_key=?1
                AND (date IS NULL OR date <= ?3)
              ORDER BY date DESC LIMIT ?2",
@@ -1018,9 +1018,10 @@ impl Db {
             .query_map(params![session_key, limit as i64, clock_now], |row| {
                 Ok(RaceControlMsg {
                     date: row.get(0)?,
-                    flag: row.get(1)?,
-                    message: row.get(2)?,
-                    lap_number: row.get(3)?,
+                    category: row.get(1)?,
+                    flag: row.get(2)?,
+                    message: row.get(3)?,
+                    lap_number: row.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
