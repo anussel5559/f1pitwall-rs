@@ -1140,6 +1140,31 @@ impl Db {
         Ok(rows)
     }
 
+    /// Driver numbers that produced any "real" car_data sample in
+    /// `(since_iso, until_iso]`. OpenF1 emits a `throttle/brake = 104` sentinel
+    /// once telemetry signal is lost (e.g. retired car); legitimate throttle
+    /// range is 0–100, so `throttle <= 100` cleanly filters those out.
+    ///
+    /// Single indexed scan over ~45s of car_data (~3.6k rows for a full grid
+    /// at 4 Hz) — cheap enough to call every snapshot tick.
+    pub fn get_active_drivers_since(
+        &self,
+        session_key: i64,
+        since_iso: &str,
+        until_iso: &str,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT driver_number FROM car_data
+             WHERE session_key = ?1
+               AND date > ?2
+               AND date <= ?3
+               AND throttle <= 100",
+        )?;
+        let rows = stmt.query_map(params![session_key, since_iso, until_iso], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()
+            .map_err(Into::into)
+    }
+
     /// Get the most recent location for each of the requested drivers.
     pub fn get_latest_locations(
         &self,
