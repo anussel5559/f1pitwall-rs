@@ -129,6 +129,7 @@ pub struct CompoundAllocation {
 #[ts(export)]
 pub struct RaceControlMsg {
     pub date: String,
+    pub category: String,
     pub flag: String,
     pub message: String,
     pub lap_number: Option<i64>,
