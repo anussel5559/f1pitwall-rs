@@ -891,12 +891,41 @@ impl Db {
         let lap = up_to_lap.unwrap_or(i64::MAX);
         let since = since_date.unwrap_or("");
         let dn = driver_number.unwrap_or(-1);
+        // `closed_in_laps`: the in-lap exclusion must mirror the board-row
+        // gate. OpenF1's stints endpoint reports lap_end = the latest
+        // completed lap of an open (live) stint, so the previous
+        // `l.lap_number != s.lap_end` form silently dropped the most-recent
+        // completed lap of every driver who hadn't pitted yet — turning a
+        // freshly-set PB lap yellow until they completed one more lap. A
+        // stint only really counts as closed once a successor stint exists
+        // or a pit_stops row at lap_end has landed (same shape used by
+        // get_race_board_rows / get_qualifying_board_rows).
         let mut stmt = self.conn.prepare(
-            "SELECT MIN(l.lap_duration)
+            "WITH closed_in_laps AS (
+                SELECT s.driver_number, s.lap_end as lap_number
+                FROM stints s
+                WHERE s.session_key=?1 AND s.lap_end IS NOT NULL
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM stints s2
+                        WHERE s2.session_key=s.session_key
+                          AND s2.driver_number=s.driver_number
+                          AND s2.stint_number > s.stint_number
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pit_stops ps
+                        WHERE ps.session_key=s.session_key
+                          AND ps.driver_number=s.driver_number
+                          AND ps.lap_number=s.lap_end
+                          AND ps.date IS NOT NULL
+                          AND datetime(ps.date) <= datetime(?4)
+                    )
+                  )
+             )
+             SELECT MIN(l.lap_duration)
              FROM laps l
-             LEFT JOIN stints s ON s.session_key=l.session_key
-               AND s.driver_number=l.driver_number
-               AND l.lap_number BETWEEN s.lap_start AND s.lap_end
+             LEFT JOIN closed_in_laps cil ON cil.driver_number=l.driver_number
+                AND cil.lap_number=l.lap_number
              WHERE l.session_key=?1
                AND (?5 = -1 OR l.driver_number = ?5)
                AND l.date_start IS NOT NULL
@@ -905,7 +934,7 @@ impl Db {
                AND l.lap_number <= ?2
                AND (?3='' OR l.date_start >= ?3)
                AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) + 1 AS TEXT) || ' seconds') <= datetime(?4)
-               AND (s.lap_end IS NULL OR l.lap_number != s.lap_end)",
+               AND cil.driver_number IS NULL",
         )?;
         let result = stmt.query_row(params![session_key, lap, since, clock_now, dn], |row| {
             row.get::<_, Option<f64>>(0)
@@ -924,21 +953,72 @@ impl Db {
         let lap = up_to_lap.unwrap_or(i64::MAX);
         let since = since_date.unwrap_or("");
         let dn = driver_number.unwrap_or(-1);
+        // Per-sector eligibility gate mirrors `visible_sectors`: each sector
+        // is counted toward best-sector aggregates the instant it has
+        // elapsed in the replay clock (`date_start + Σsᵢ <= clock_now`),
+        // not after the full lap finishes. The previous form required
+        // `lap_duration IS NOT NULL` + a `date_start + lap_duration + 1s`
+        // check, which meant a freshly-visible sector — including every
+        // first-lap S1 of a race, and any new fastest sector on an
+        // in-progress lap — was never matched against the bests it should
+        // own. `julianday` gives sub-second precision so the gate matches
+        // the visible-sector ms threshold rather than the prior 1s-buffered
+        // datetime() one.
+        //
+        // `closed_in_laps`: see best_lap_inner for the open-stint
+        // rationale. Same CTE; ensures an open-stint driver's most-recent
+        // completed lap still contributes to their PB sectors.
         let mut stmt = self.conn.prepare(
-            "SELECT MIN(l.duration_sector_1), MIN(l.duration_sector_2), MIN(l.duration_sector_3)
+            "WITH closed_in_laps AS (
+                SELECT s.driver_number, s.lap_end as lap_number
+                FROM stints s
+                WHERE s.session_key=?1 AND s.lap_end IS NOT NULL
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM stints s2
+                        WHERE s2.session_key=s.session_key
+                          AND s2.driver_number=s.driver_number
+                          AND s2.stint_number > s.stint_number
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pit_stops ps
+                        WHERE ps.session_key=s.session_key
+                          AND ps.driver_number=s.driver_number
+                          AND ps.lap_number=s.lap_end
+                          AND ps.date IS NOT NULL
+                          AND datetime(ps.date) <= datetime(?4)
+                    )
+                  )
+             )
+             SELECT
+               MIN(CASE
+                    WHEN l.duration_sector_1 IS NOT NULL
+                     AND julianday(l.date_start) + l.duration_sector_1 / 86400.0 <= julianday(?4)
+                    THEN l.duration_sector_1
+                   END) AS best_s1,
+               MIN(CASE
+                    WHEN l.duration_sector_1 IS NOT NULL
+                     AND l.duration_sector_2 IS NOT NULL
+                     AND julianday(l.date_start) + (l.duration_sector_1 + l.duration_sector_2) / 86400.0 <= julianday(?4)
+                    THEN l.duration_sector_2
+                   END) AS best_s2,
+               MIN(CASE
+                    WHEN l.duration_sector_1 IS NOT NULL
+                     AND l.duration_sector_2 IS NOT NULL
+                     AND l.duration_sector_3 IS NOT NULL
+                     AND julianday(l.date_start) + (l.duration_sector_1 + l.duration_sector_2 + l.duration_sector_3) / 86400.0 <= julianday(?4)
+                    THEN l.duration_sector_3
+                   END) AS best_s3
              FROM laps l
-             LEFT JOIN stints s ON s.session_key=l.session_key
-               AND s.driver_number=l.driver_number
-               AND l.lap_number BETWEEN s.lap_start AND s.lap_end
+             LEFT JOIN closed_in_laps cil ON cil.driver_number=l.driver_number
+                AND cil.lap_number=l.lap_number
              WHERE l.session_key=?1
                AND (?5 = -1 OR l.driver_number = ?5)
                AND l.date_start IS NOT NULL
                AND l.is_pit_out_lap=0
-               AND l.lap_duration IS NOT NULL AND l.lap_duration > 0
                AND l.lap_number <= ?2
                AND (?3='' OR l.date_start >= ?3)
-               AND datetime(l.date_start, '+' || CAST(CAST(l.lap_duration AS INTEGER) + 1 AS TEXT) || ' seconds') <= datetime(?4)
-               AND (s.lap_end IS NULL OR l.lap_number != s.lap_end)",
+               AND cil.driver_number IS NULL",
         )?;
         let result = stmt.query_row(params![session_key, lap, since, clock_now, dn], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1791,5 +1871,384 @@ mod tests {
         let rows = db.get_race_board_rows(SK, "2026-05-01T14:05:00").unwrap();
         let r = rows.iter().find(|r| r.driver_number == 16).unwrap();
         assert_eq!(r.pit_count, 2, "current lap's pit stop must not be counted");
+    }
+
+    /// Inserts a lap with independently-controlled sector durations, an
+    /// optional lap_duration (None = lap still in progress), and the
+    /// `is_pit_out_lap` flag. Used by the best-sector tests below to model
+    /// in-progress laps where lap_duration is NULL but some sectors are
+    /// already populated.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_lap_sectors(
+        db: &Db,
+        dn: i64,
+        lap: i64,
+        date_start: &str,
+        s1: Option<f64>,
+        s2: Option<f64>,
+        s3: Option<f64>,
+        lap_duration: Option<f64>,
+        is_pit_out: bool,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO laps (session_key, driver_number, lap_number, lap_duration, \
+                 duration_sector_1, duration_sector_2, duration_sector_3, is_pit_out_lap, date_start) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![SK, dn, lap, lap_duration, s1, s2, s3, is_pit_out as i64, date_start],
+            )
+            .unwrap();
+    }
+
+    /// Lap 1 of a race: every driver is on their first ever sector. The
+    /// leader's S1 is the field's session best; every driver's own S1 is
+    /// their personal best (it is the only one they have). The previous
+    /// shape required `lap_duration IS NOT NULL` and so returned `None` for
+    /// every driver and every sector until lap 1 finished — leaving the
+    /// leaderboard yellow on every first-lap sector. The per-sector
+    /// elapsed-time gate must include the in-progress lap.
+    #[test]
+    fn best_sectors_includes_in_progress_lap_one_s1() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        setup_driver(&db, 12);
+        setup_driver(&db, 63);
+        // Race lap 1: only S1 has elapsed for each driver. lap_duration is
+        // NULL because the lap is still in progress.
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(28.629),
+            None,
+            None,
+            None,
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            12,
+            1,
+            "2026-05-01T14:00:00",
+            Some(29.596),
+            None,
+            None,
+            None,
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            63,
+            1,
+            "2026-05-01T14:00:00",
+            Some(30.362),
+            None,
+            None,
+            None,
+            false,
+        );
+
+        // Clock is past every driver's S1 completion (date_start + 30s).
+        let clk = "2026-05-01T14:00:32";
+
+        let (s1, s2, s3) = db.get_best_sectors(SK, Some(1), None, clk).unwrap();
+        assert_eq!(s1, Some(28.629), "session-best S1 = NOR's lap 1");
+        assert_eq!(s2, None, "no driver has finished S2 yet");
+        assert_eq!(s3, None);
+
+        // Per-driver: each driver's only S1 *is* their PB S1.
+        let (s1, _, _) = db.get_driver_best_sectors(SK, 4, Some(1), None, clk).unwrap();
+        assert_eq!(s1, Some(28.629));
+        let (s1, _, _) = db
+            .get_driver_best_sectors(SK, 12, Some(1), None, clk)
+            .unwrap();
+        assert_eq!(s1, Some(29.596));
+        let (s1, _, _) = db
+            .get_driver_best_sectors(SK, 63, Some(1), None, clk)
+            .unwrap();
+        assert_eq!(s1, Some(30.362));
+    }
+
+    /// In-progress lap 1: S1 has elapsed but the clock has not yet reached
+    /// S2's completion. S1 must be eligible, S2 must not — even though
+    /// `duration_sector_2` is non-null in the row. Pins the per-sector
+    /// time gate against the obvious "any populated sector counts" mistake.
+    #[test]
+    fn best_sectors_per_sector_time_gate_excludes_future_sectors() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        // Pre-loaded replay row: all three sectors are written into the
+        // laps table at session attach, but lap_duration is NULL and the
+        // clock has only advanced to mid-lap.
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(28.629),
+            Some(35.0),
+            Some(25.0),
+            None,
+            false,
+        );
+
+        // Clock is at +32s — past S1 (28.629s) but before S1+S2 (63.629s).
+        let clk = "2026-05-01T14:00:32";
+        let (s1, s2, s3) = db.get_best_sectors(SK, Some(1), None, clk).unwrap();
+        assert_eq!(s1, Some(28.629));
+        assert_eq!(s2, None, "S2 has not yet elapsed; must not be included");
+        assert_eq!(s3, None);
+
+        // Advance past S2 but before S3 (28.629 + 35.0 = 63.629s).
+        let clk = "2026-05-01T14:01:05";
+        let (s1, s2, s3) = db.get_best_sectors(SK, Some(1), None, clk).unwrap();
+        assert_eq!(s1, Some(28.629));
+        assert_eq!(s2, Some(35.0));
+        assert_eq!(s3, None);
+    }
+
+    /// Open stint (driver hasn't pitted): `stints[0].lap_end` advances to
+    /// the latest completed lap. The previous `l.lap_number != s.lap_end`
+    /// exclusion would silently drop that lap from the best-sector pool,
+    /// so a freshly-set PB sector on a long opening stint would show as
+    /// `Normal` (yellow) until the next lap completed. The closed-stint
+    /// CTE must keep the open-stint's lap_end eligible.
+    #[test]
+    fn best_sectors_open_stint_latest_lap_counts_toward_pb() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        // Two completed laps; lap 2 has the faster S1.
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(29.0),
+            Some(35.0),
+            Some(25.0),
+            Some(89.0),
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            2,
+            "2026-05-01T14:01:29",
+            Some(28.5),
+            Some(34.5),
+            Some(24.8),
+            Some(87.8),
+            false,
+        );
+        // Open stint: lap_end = 2 (latest completed lap). No successor
+        // stint, no pit_stops row at lap 2.
+        insert_stint(&db, 4, 1, 1, 2);
+
+        let clk = "2026-05-01T14:03:00";
+        let (s1, s2, s3) = db
+            .get_driver_best_sectors(SK, 4, Some(2), None, clk)
+            .unwrap();
+        assert_eq!(s1, Some(28.5), "open-stint lap 2 must contribute to PB S1");
+        assert_eq!(s2, Some(34.5));
+        assert_eq!(s3, Some(24.8));
+
+        let best_lap = db.get_driver_best_lap(SK, 4, Some(2), None, clk).unwrap();
+        assert_eq!(
+            best_lap,
+            Some(87.8),
+            "open-stint lap 2 must contribute to PB lap"
+        );
+    }
+
+    /// Closed stint: a successor stint exists, so the prior stint's
+    /// lap_end is a real in-lap and stays excluded from the PB pool.
+    /// Guards against the open-stint fix accidentally re-including in-laps.
+    #[test]
+    fn best_sectors_closed_stint_in_lap_still_excluded() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        // Lap 1: regular. Lap 2: the in-lap (pit entry hurts S3). Lap 3:
+        // out-lap of stint 2 (excluded by is_pit_out_lap).
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(29.0),
+            Some(35.0),
+            Some(25.0),
+            Some(89.0),
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            2,
+            "2026-05-01T14:01:29",
+            Some(28.5),
+            Some(34.5),
+            Some(40.0), // pit-entry S3
+            Some(103.0),
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            3,
+            "2026-05-01T14:03:12",
+            Some(45.0),
+            Some(34.0),
+            Some(24.5),
+            Some(103.5),
+            true,
+        );
+        insert_stint(&db, 4, 1, 1, 2);
+        insert_stint(&db, 4, 2, 3, 3); // successor stint → stint 1 closed
+
+        let clk = "2026-05-01T14:05:00";
+        let (s1, s2, s3) = db
+            .get_driver_best_sectors(SK, 4, Some(3), None, clk)
+            .unwrap();
+        // Lap 1's sectors only: lap 2 is the closed-stint in-lap
+        // (excluded), lap 3 is the out-lap (excluded by design).
+        assert_eq!(s1, Some(29.0));
+        assert_eq!(s2, Some(35.0));
+        assert_eq!(s3, Some(25.0));
+    }
+
+    /// Pre-loaded replay future: when `clock_now` sits between two laps,
+    /// the upcoming lap's sectors must be excluded even if the row exists
+    /// in the `laps` table (replay bootstrap pre-loads the entire
+    /// session). Pins the per-sector time gate against the regression
+    /// where dropping `lap_duration IS NOT NULL` could leak future data.
+    #[test]
+    fn best_sectors_replay_future_lap_excluded() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(29.0),
+            Some(35.0),
+            Some(25.0),
+            Some(89.0),
+            false,
+        );
+        // Pre-loaded lap 2 in the replay future: clock_now will stop short
+        // of its date_start, so none of its sectors are eligible.
+        insert_lap_sectors(
+            &db,
+            4,
+            2,
+            "2026-05-01T14:10:00",
+            Some(20.0), // would beat lap 1 if leaked
+            Some(20.0),
+            Some(20.0),
+            Some(60.0),
+            false,
+        );
+
+        let clk = "2026-05-01T14:02:00"; // before lap 2's date_start
+        let (s1, s2, s3) = db
+            .get_driver_best_sectors(SK, 4, Some(2), None, clk)
+            .unwrap();
+        assert_eq!(s1, Some(29.0), "replay-future S1 must not leak");
+        assert_eq!(s2, Some(35.0));
+        assert_eq!(s3, Some(25.0));
+    }
+
+    /// Out-laps are excluded by design (S1 contaminated by pit exit). A
+    /// later regular lap with a slower S1 must own the PB rather than the
+    /// out-lap's value, even if the out-lap's S1 is numerically smaller.
+    #[test]
+    fn best_sectors_out_lap_excluded_by_design() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        // Stint 1: lap 1 = grid-start lap (not flagged as pit-out). Lap 2
+        // is an in-lap (closed stint), lap 3 is the out-lap of stint 2,
+        // lap 4 is a regular lap of stint 2.
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(30.0),
+            Some(35.0),
+            Some(25.0),
+            Some(90.0),
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            2,
+            "2026-05-01T14:01:30",
+            Some(28.0),
+            Some(34.0),
+            Some(40.0),
+            Some(102.0),
+            false,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            3,
+            "2026-05-01T14:03:12",
+            Some(20.0), // contaminated pit-exit S1, must be ignored
+            Some(40.0),
+            Some(24.0),
+            Some(84.0),
+            true,
+        );
+        insert_lap_sectors(
+            &db,
+            4,
+            4,
+            "2026-05-01T14:04:36",
+            Some(29.5),
+            Some(33.5),
+            Some(24.5),
+            Some(87.5),
+            false,
+        );
+        insert_stint(&db, 4, 1, 1, 2);
+        insert_stint(&db, 4, 2, 3, 4);
+
+        let clk = "2026-05-01T14:06:30";
+        let (s1, _s2, _s3) = db
+            .get_driver_best_sectors(SK, 4, Some(4), None, clk)
+            .unwrap();
+        // PB S1 = lap 4's 29.5, NOT lap 3's 20.0 (out-lap excluded).
+        // Lap 2 is the closed-stint in-lap (excluded).
+        assert_eq!(s1, Some(29.5));
+    }
+
+    /// First lap of a race for the field's best lap: until at least one
+    /// driver has finished lap 1, `get_best_lap` is `None`. The previous
+    /// shape already returned `None` here; this pins the contract so the
+    /// open-stint CTE rewrite doesn't accidentally let an in-progress lap
+    /// (with NULL lap_duration) slip through.
+    #[test]
+    fn best_lap_in_progress_first_lap_returns_none() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 4);
+        insert_lap_sectors(
+            &db,
+            4,
+            1,
+            "2026-05-01T14:00:00",
+            Some(28.629),
+            None,
+            None,
+            None, // lap not finished
+            false,
+        );
+
+        let clk = "2026-05-01T14:00:32";
+        let best = db.get_best_lap(SK, Some(1), None, clk).unwrap();
+        assert_eq!(best, None);
     }
 }
