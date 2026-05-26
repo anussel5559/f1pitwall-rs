@@ -1958,7 +1958,9 @@ mod tests {
         assert_eq!(s3, None);
 
         // Per-driver: each driver's only S1 *is* their PB S1.
-        let (s1, _, _) = db.get_driver_best_sectors(SK, 4, Some(1), None, clk).unwrap();
+        let (s1, _, _) = db
+            .get_driver_best_sectors(SK, 4, Some(1), None, clk)
+            .unwrap();
         assert_eq!(s1, Some(28.629));
         let (s1, _, _) = db
             .get_driver_best_sectors(SK, 12, Some(1), None, clk)
