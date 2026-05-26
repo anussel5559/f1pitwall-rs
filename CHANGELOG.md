@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.35.7
+
+- Fix `get_driver_lap_starts` reporting in-progress laps as completed in replay (`crates/f1core/src/db/queries.rs`)
+  - Symptom diagnosed against the Montreal 2026 race DB: at clock 20:41:29 UTC, the web app's `LAST 5` popover showed RUS's lap 25 as completed at `1:17.038`, while the leaderboard's last-lap column correctly showed lap 24 (`1:16.828`) because `race_display`'s per-sector gate knew lap 25 wasn't done yet. RUS's lap 25 actually ends at `20:40:37.815 + 77.038 = 20:41:54.853` — 25 s in the replay future at that clock. Three sources disagreed: leaderboard (correct), popover (premature), and the bottom "Lap 26 / 70" counter (premature; fixed in pitwall 0.37.5)
+  - Root cause: the SQL returned `duration_sector_1/2/3` and `lap_duration` directly from the row. In replay mode the bootstrap pre-loads every lap's full row at session attach — including `lap_duration` — so any consumer that read "lap_duration is not null → lap is done" saw every lap as completed the moment its `date_start` passed `clock_now`. `visible_sectors` (the per-sector reveal that `race_display` uses) gates each sector on `date_start + Σsᵢ <= clock_now`; this query had no such gate, so the two code paths disagreed for the entire ~minute between a lap's start and its actual end. The popover-vs-leaderboard mismatch was the most visible consequence; any other consumer reading the same shape would see the same lie
+  - Fix: wrap each sector and `lap_duration` in a `CASE WHEN … julianday(date_start) + Σsᵢ / 86400.0 <= julianday(?) THEN value END`. Same gate, same precision, same shape used by `best_sectors_inner` since 0.35.5. `lap_number` and `date_start` are still emitted unconditionally — telemetry charts rely on them to mark "lap N started here" before the lap finishes, and that boundary is correct as soon as `date_start <= clock_now`
+  - Tests: 2 new tests in `crates/f1core/src/db/queries.rs`. `lap_starts_masks_lap_duration_until_lap_elapses` reproduces the Montreal scenario — lap 25 with all sectors and `lap_duration` populated, clock mid-lap — and asserts S1/S2 come through but S3 and `lap_duration` mask to `None`, then advances the clock past lap end and asserts everything becomes visible. `lap_starts_always_returns_boundary_metadata` pins the chart-boundary contract: an in-progress lap with only S1 and no `lap_duration` still emits `lap_number` and `date_start`
+
 ## 0.35.6
 
 - Add `(session_key, date)` index on `car_data` and `(session_key, lap_number)` index on `laps` so range-by-session queries seek instead of scanning the per-session partition (`crates/f1core/src/db/schema.rs`)

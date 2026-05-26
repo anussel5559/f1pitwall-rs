@@ -1137,6 +1137,18 @@ impl Db {
     /// Per-lap summary for a driver: (lap_number, date_start, s1, s2, s3, lap_duration).
     /// Used both to mark lap boundaries on telemetry charts and to surface
     /// the most-recently-completed lap's sector breakdown.
+    ///
+    /// Each sector value and `lap_duration` is masked to `None` until that
+    /// sector / the whole lap has actually elapsed in the replay clock
+    /// (`date_start + Σsᵢ <= clock_now`). Same gate `visible_sectors`
+    /// uses; same gate the best-sector aggregates use (see
+    /// `best_sectors_inner`). Without this, replay-bootstrap pre-loads
+    /// every lap's `lap_duration` at session attach, and any consumer
+    /// reading "last completed lap" (e.g. the web app's `LAST 5` popover)
+    /// sees the in-progress lap as already finished — disagreeing with
+    /// the leaderboard, which `race_display` correctly gates per sector.
+    /// `lap_number` and `date_start` are always returned so chart
+    /// boundary markers still appear at lap start, before completion.
     pub fn get_driver_lap_starts(
         &self,
         session_key: i64,
@@ -1145,8 +1157,21 @@ impl Db {
     ) -> Result<Vec<LapSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT lap_number, date_start,
-                    duration_sector_1, duration_sector_2, duration_sector_3,
-                    lap_duration
+                    CASE WHEN duration_sector_1 IS NOT NULL
+                          AND julianday(date_start) + duration_sector_1 / 86400.0 <= julianday(?3)
+                         THEN duration_sector_1 END AS s1,
+                    CASE WHEN duration_sector_1 IS NOT NULL
+                          AND duration_sector_2 IS NOT NULL
+                          AND julianday(date_start) + (duration_sector_1 + duration_sector_2) / 86400.0 <= julianday(?3)
+                         THEN duration_sector_2 END AS s2,
+                    CASE WHEN duration_sector_1 IS NOT NULL
+                          AND duration_sector_2 IS NOT NULL
+                          AND duration_sector_3 IS NOT NULL
+                          AND julianday(date_start) + (duration_sector_1 + duration_sector_2 + duration_sector_3) / 86400.0 <= julianday(?3)
+                         THEN duration_sector_3 END AS s3,
+                    CASE WHEN lap_duration IS NOT NULL
+                          AND julianday(date_start) + lap_duration / 86400.0 <= julianday(?3)
+                         THEN lap_duration END AS lap_duration
              FROM laps
              WHERE session_key=?1 AND driver_number=?2
                AND date_start IS NOT NULL AND date_start <= ?3
@@ -2252,5 +2277,82 @@ mod tests {
         let clk = "2026-05-01T14:00:32";
         let best = db.get_best_lap(SK, Some(1), None, clk).unwrap();
         assert_eq!(best, None);
+    }
+
+    /// Regression for the Montreal 2026 popover/leaderboard mismatch: at
+    /// clock 20:41:29, RUS's lap 25 row already has `lap_duration=77.038`
+    /// in the DB (pre-loaded by replay bootstrap), but the lap doesn't
+    /// actually end until 20:41:54. The popover (which reads
+    /// `get_driver_lap_starts`) was treating lap 25 as completed,
+    /// disagreeing with the leaderboard's `race_display` per-sector
+    /// gate. After the fix, `lap_duration` (and any not-yet-elapsed
+    /// sectors) come back as `None` until the clock catches up.
+    #[test]
+    fn lap_starts_masks_lap_duration_until_lap_elapses() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 63);
+        // Lap 25 from Montreal race: ends at 20:41:54.853 UTC.
+        insert_lap_sectors(
+            &db,
+            63,
+            25,
+            "2026-05-24T20:40:37.815",
+            Some(22.080),
+            Some(24.356),
+            Some(30.602),
+            Some(77.038),
+            false,
+        );
+
+        // Mid-lap-25 (past S2, before S3): S1 and S2 are visible, S3 and
+        // lap_duration are not.
+        let clk = "2026-05-24T20:41:29";
+        let rows = db.get_driver_lap_starts(SK, 63, clk).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (lap_num, _, s1, s2, s3, dur) = &rows[0];
+        assert_eq!(*lap_num, 25);
+        assert_eq!(*s1, Some(22.080));
+        assert_eq!(*s2, Some(24.356));
+        assert_eq!(*s3, None, "S3 hasn't elapsed yet");
+        assert_eq!(*dur, None, "lap not finished — lap_duration must be masked");
+
+        // Just past lap end — everything visible.
+        let clk = "2026-05-24T20:41:55";
+        let rows = db.get_driver_lap_starts(SK, 63, clk).unwrap();
+        let (_, _, s1, s2, s3, dur) = &rows[0];
+        assert_eq!(*s1, Some(22.080));
+        assert_eq!(*s2, Some(24.356));
+        assert_eq!(*s3, Some(30.602));
+        assert_eq!(*dur, Some(77.038));
+    }
+
+    /// Lap boundaries (lap_number + date_start) must always be emitted
+    /// regardless of completion — telemetry charts use them to mark "lap
+    /// N started here" even before the lap finishes.
+    #[test]
+    fn lap_starts_always_returns_boundary_metadata() {
+        let db = Db::open_in_memory().unwrap();
+        setup_driver(&db, 63);
+        // In-progress lap: only S1 elapsed, no lap_duration in the DB.
+        insert_lap_sectors(
+            &db,
+            63,
+            1,
+            "2026-05-24T20:00:00",
+            Some(28.629),
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let clk = "2026-05-24T20:00:35";
+        let rows = db.get_driver_lap_starts(SK, 63, clk).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (lap_num, date_start, s1, _, _, dur) = &rows[0];
+        assert_eq!(*lap_num, 1, "boundary lap_number always present");
+        assert_eq!(date_start, "2026-05-24T20:00:00");
+        assert_eq!(*s1, Some(28.629));
+        assert_eq!(*dur, None);
     }
 }
