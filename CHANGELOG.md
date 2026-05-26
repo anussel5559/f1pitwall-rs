@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.35.6
+
+- Add `(session_key, date)` index on `car_data` and `(session_key, lap_number)` index on `laps` so range-by-session queries seek instead of scanning the per-session partition (`crates/f1core/src/db/schema.rs`)
+  - Both tables' PKs lead with `(session_key, driver_number, …)`. Any query that filters by `session_key` plus a `date` range or specific `lap_number` — *without* pinning `driver_number` — can only use the leftmost PK column, so the planner falls back to `SEARCH … USING INDEX sqlite_autoindex_*_1 (session_key=?)` and row-scans every row that matches `session_key`
+  - Hot path on `car_data`: `get_active_drivers_since` (the retirement-detection query added in 0.35.4) runs every snapshot tick (~5 Hz per replay socket). On a Singapore-sized race that's ~33k rows scanned per tick → ~165k rows/sec per connected client, just to pull DISTINCT driver_number for the last 45 s. The comment in pitwall's `board.rs` estimating "one ~3.6k-row scan" assumed the planner could date-range-seek; the autoindex doesn't allow that. EXPLAIN before: `SEARCH car_data USING INDEX sqlite_autoindex_car_data_1 (session_key=?)`. After: `SEARCH car_data USING INDEX car_data_session_date (session_key=? AND date>? AND date<?)` — actual 45 s window only (~3.6k rows on a Singapore-sized race)
+  - Hot path on `laps`: pitwall's `current_lap` probe (`SELECT 1 FROM laps WHERE session_key=?1 AND lap_number=?2 …`, added in pitwall 0.37.3) runs every snapshot tick. EXPLAIN before: `SEARCH laps USING INDEX sqlite_autoindex_laps_1 (session_key=?)` — scans all ~900 lap rows per tick. After: `SEARCH laps USING INDEX laps_session_lap (session_key=? AND lap_number=?)` — direct seek
+  - `CREATE INDEX IF NOT EXISTS` makes the change idempotent on existing prod DBs. Index build on first open after upgrade is one-time and proportional to current row count (sub-second on local 33k-row `car_data` / 900-row `laps`; expect a few seconds on a long-running Fly DB the first time the writer connects)
+  - Existing driver-specific queries (e.g. `get_race_board_rows`'s correlated `MAX(lap_number) WHERE … driver_number=…` subqueries) still prefer the PK autoindex — the planner picks the autoindex when `driver_number` is in the predicate, the new index only when it isn't
+
 ## 0.35.5
 
 - Fix best-sector / best-lap classification leaving freshly-set bests as `Normal` (yellow) instead of `PersonalBest` / `SessionBest` (`crates/f1core/src/db/queries.rs`)

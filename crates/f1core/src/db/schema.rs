@@ -179,4 +179,13 @@ CREATE TABLE IF NOT EXISTS pm_call (
 
 CREATE INDEX IF NOT EXISTS pm_call_session ON pm_call(session_key, mode, user_id);
 
+-- Range-scan indexes on (session_key, date|lap_number).
+-- The PKs lead with (session_key, driver_number, …), so any query that filters by
+-- session_key + date/lap_number without a specific driver falls back to a full
+-- per-session scan via the autoindex. These let SQLite seek the date/lap range
+-- directly. Hot paths: get_active_drivers_since (retirement detection, every
+-- snapshot tick) and the laps-by-session current_lap probe in pitwall's board.
+CREATE INDEX IF NOT EXISTS car_data_session_date ON car_data(session_key, date);
+CREATE INDEX IF NOT EXISTS laps_session_lap ON laps(session_key, lap_number);
+
 ";
