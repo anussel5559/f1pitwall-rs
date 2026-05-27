@@ -221,7 +221,11 @@ async fn fetch_car_data_chunk(
     })
     .await
     else {
-        tracing::error!(session_key, from, "bootstrap car_data chunk failed after retries");
+        tracing::error!(
+            session_key,
+            from,
+            "bootstrap car_data chunk failed after retries"
+        );
         push_toast(
             toasts,
             format!("car_data {from}: chunk failed after retries"),
@@ -256,7 +260,11 @@ async fn fetch_location_chunk(
     })
     .await
     else {
-        tracing::error!(session_key, from, "bootstrap location chunk failed after retries");
+        tracing::error!(
+            session_key,
+            from,
+            "bootstrap location chunk failed after retries"
+        );
         push_toast(
             toasts,
             format!("location {from}: chunk failed after retries"),

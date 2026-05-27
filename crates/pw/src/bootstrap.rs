@@ -33,15 +33,9 @@ pub async fn run(
     status: Status,
 ) {
     let status_for_cb = status.clone();
-    bootstrap_session_data_with_progress(
-        session_key,
-        client,
-        db,
-        toasts,
-        move |p: Progress| {
-            *status_for_cb.lock().unwrap() = Some(p);
-        },
-    )
+    bootstrap_session_data_with_progress(session_key, client, db, toasts, move |p: Progress| {
+        *status_for_cb.lock().unwrap() = Some(p);
+    })
     .await;
     *status.lock().unwrap() = None;
 }
