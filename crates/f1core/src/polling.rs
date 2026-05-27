@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -7,9 +8,28 @@ use crate::clock::SessionClock;
 use crate::db::Db;
 use crate::session_types::{Endpoint, SessionType};
 use crate::toast::{Toasts, push_toast};
+use crate::util::time::{fmt_ts, parse_ts};
 
-/// How many drivers to fetch car_data + location for in parallel during replay bootstrap.
-const TELEMETRY_BOOTSTRAP_CONCURRENCY: usize = 4;
+/// Replay-bootstrap chunk size. The largest window OpenF1 will return for
+/// all-driver `car_data` / `location` requests before 422'ing on payload size,
+/// and small enough that each response stays comfortably under the 10 s
+/// `reqwest` timeout (15 min of `car_data` ≈ 12 MB ≈ 6–7 s typical).
+const BOOTSTRAP_CHUNK_SECS: i64 = 900;
+
+/// Per-chunk retry budget. Dominant failure mode is transient network / API
+/// hiccups (`error decoding response body`, occasional 5xx); a couple of
+/// quick retries with exponential backoff turns those into eventually-
+/// consistent loads rather than permanent gaps.
+const BOOTSTRAP_CHUNK_RETRIES: usize = 3;
+
+/// Progress signal for the replay bootstrap. Emitted via the callback passed
+/// to [`bootstrap_session_data_with_progress`] after each chunk completes,
+/// suitable for driving a `Loading N/M` overlay.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapProgress {
+    pub completed: usize,
+    pub total: usize,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_polling(
@@ -78,16 +98,44 @@ pub async fn run_polling(
     }
 }
 
-/// Pre-load car_data + location for every driver in a replay session, scoped to
-/// the session window (`date_start`..`date_end`) so we don't pull pre-race
-/// formation/grid samples we'd never display. Idempotent per driver — drivers
-/// whose row counts already meet the completeness threshold are skipped.
+/// Pre-load `car_data` + `location` for every driver in a replay session,
+/// scoped to the session window (`date_start..date_end`) so we don't pull
+/// pre-race formation/grid samples we'd never display.
+///
+/// Implementation note: each request covers a fixed 15-minute window for *all*
+/// drivers (no `driver_number` filter), rather than per-driver full-race
+/// requests. For a 2 h race that's ~16 total requests instead of ~88, and each
+/// response stays well under `reqwest`'s 10 s timeout — per-driver full-race
+/// `car_data` fetches (~3.9 MB) reliably time out under any concurrency on
+/// modestly-bandwidth-constrained connections.
+///
+/// Idempotent across reopens: a quick check up front skips the entire fetch
+/// loop when every driver already meets the per-table completeness threshold
+/// (`car_data_complete` / `location_complete`). Mid-loop reopens are safe too,
+/// since `upsert_car_data` / `upsert_location` use `INSERT OR IGNORE` on a PK
+/// that includes `date`.
 pub async fn bootstrap_session_data(
     session_key: i64,
     client: Arc<OpenF1Client>,
     db: Arc<Mutex<Db>>,
     toasts: Toasts,
 ) {
+    bootstrap_session_data_with_progress(session_key, client, db, toasts, |_| {}).await
+}
+
+/// [`bootstrap_session_data`] with a progress callback fired after each chunk
+/// completes. Used by TUI replay sessions to drive the `Loading N/M` overlay;
+/// web callers that don't surface bootstrap progress should call the plain
+/// [`bootstrap_session_data`] above.
+pub async fn bootstrap_session_data_with_progress<F>(
+    session_key: i64,
+    client: Arc<OpenF1Client>,
+    db: Arc<Mutex<Db>>,
+    toasts: Toasts,
+    mut on_progress: F,
+) where
+    F: FnMut(BootstrapProgress) + Send,
+{
     let (drivers, bounds) = {
         let db = db.lock().unwrap();
         let drivers = match db.get_driver_numbers(session_key) {
@@ -116,168 +164,158 @@ pub async fn bootstrap_session_data(
         );
         return;
     };
-    let date_start = Arc::new(date_start);
-    let date_end = Arc::new(date_end);
-
-    let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let mut iter = drivers.into_iter();
-
-    for _ in 0..TELEMETRY_BOOTSTRAP_CONCURRENCY {
-        if let Some(d) = iter.next() {
-            spawn_driver_bootstrap(
-                &mut set,
-                session_key,
-                d,
-                client.clone(),
-                db.clone(),
-                date_start.clone(),
-                date_end.clone(),
-                toasts.clone(),
-            );
-        }
-    }
-
-    while set.join_next().await.is_some() {
-        if let Some(d) = iter.next() {
-            spawn_driver_bootstrap(
-                &mut set,
-                session_key,
-                d,
-                client.clone(),
-                db.clone(),
-                date_start.clone(),
-                date_end.clone(),
-                toasts.clone(),
-            );
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_driver_bootstrap(
-    set: &mut tokio::task::JoinSet<()>,
-    session_key: i64,
-    driver: i64,
-    client: Arc<OpenF1Client>,
-    db: Arc<Mutex<Db>>,
-    date_start: Arc<String>,
-    date_end: Arc<String>,
-    toasts: Toasts,
-) {
-    set.spawn(async move {
-        fetch_driver_car_data(
+    let (Some(start_ts), Some(end_ts)) = (parse_ts(&date_start), parse_ts(&date_end)) else {
+        tracing::warn!(
             session_key,
-            driver,
-            &client,
-            &db,
-            &date_start,
-            &date_end,
-            &toasts,
-        )
-        .await;
-        fetch_driver_location(
-            session_key,
-            driver,
-            &client,
-            &db,
-            &date_start,
-            &date_end,
-            &toasts,
-        )
-        .await;
-    });
-}
+            "bootstrap_session_data: unparseable session date bounds, skipping"
+        );
+        return;
+    };
 
-async fn fetch_driver_car_data(
-    session_key: i64,
-    driver: i64,
-    client: &OpenF1Client,
-    db: &Arc<Mutex<Db>>,
-    date_start: &str,
-    date_end: &str,
-    toasts: &Toasts,
-) {
-    let already_complete = db
-        .lock()
-        .unwrap()
-        .car_data_complete(session_key, driver)
-        .unwrap_or(false);
-    if already_complete {
+    // Fast path: every driver already complete on both endpoints. Avoids
+    // walking the chunk list (and the per-chunk no-op upserts) on reopen.
+    let all_complete = {
+        let db = db.lock().unwrap();
+        drivers.iter().all(|d| {
+            db.car_data_complete(session_key, *d).unwrap_or(false)
+                && db.location_complete(session_key, *d).unwrap_or(false)
+        })
+    };
+    if all_complete {
         return;
     }
 
-    let rows = match client
-        .get_car_data(session_key, driver, Some(date_start), None, Some(date_end))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(session_key, driver, error = %e, "bootstrap car_data fetch failed");
-            push_toast(toasts, format!("car_data #{driver}: {e}"), true);
-            return;
-        }
+    let chunks_list = bootstrap_chunks(start_ts, end_ts);
+    let total = chunks_list.len();
+    on_progress(BootstrapProgress {
+        completed: 0,
+        total,
+    });
+
+    for (idx, (from, to)) in chunks_list.iter().enumerate() {
+        // car_data + location for this window are independent — let them be
+        // in-flight together. The OpenF1 client's rate limiter still serialises
+        // at the wire level, so this just hides one request's round-trip
+        // behind the other rather than uncapping concurrency.
+        tokio::join!(
+            fetch_car_data_chunk(session_key, from, to, &client, &db, &toasts),
+            fetch_location_chunk(session_key, from, to, &client, &db, &toasts),
+        );
+        on_progress(BootstrapProgress {
+            completed: idx + 1,
+            total,
+        });
+    }
+}
+
+async fn fetch_car_data_chunk(
+    session_key: i64,
+    from: &str,
+    to: &str,
+    client: &OpenF1Client,
+    db: &Arc<Mutex<Db>>,
+    toasts: &Toasts,
+) {
+    let Some(rows) = fetch_with_retry(BOOTSTRAP_CHUNK_RETRIES, || {
+        client.get_car_data_all_drivers(session_key, Some(from), Some(to))
+    })
+    .await
+    else {
+        tracing::error!(session_key, from, "bootstrap car_data chunk failed after retries");
+        push_toast(
+            toasts,
+            format!("car_data {from}: chunk failed after retries"),
+            true,
+        );
+        return;
     };
     if rows.is_empty() {
         return;
     }
-
     let db = db.lock().unwrap();
     if db.begin().is_ok() {
         if let Err(e) = db.upsert_car_data(session_key, &rows) {
-            tracing::error!(session_key, driver, error = %e, "bootstrap car_data upsert failed");
-            push_toast(toasts, format!("car_data #{driver} upsert: {e}"), true);
+            tracing::error!(session_key, error = %e, "bootstrap car_data upsert failed");
+            push_toast(toasts, format!("car_data upsert: {e}"), true);
         }
         let _ = db.commit();
     }
 }
 
-async fn fetch_driver_location(
+async fn fetch_location_chunk(
     session_key: i64,
-    driver: i64,
+    from: &str,
+    to: &str,
     client: &OpenF1Client,
     db: &Arc<Mutex<Db>>,
-    date_start: &str,
-    date_end: &str,
     toasts: &Toasts,
 ) {
-    let already_complete = db
-        .lock()
-        .unwrap()
-        .location_complete(session_key, driver)
-        .unwrap_or(false);
-    if already_complete {
+    // Empty driver slice → no `driver_number` filter → all-drivers response.
+    let Some(rows) = fetch_with_retry(BOOTSTRAP_CHUNK_RETRIES, || {
+        client.get_location(session_key, &[], Some(from), None, Some(to))
+    })
+    .await
+    else {
+        tracing::error!(session_key, from, "bootstrap location chunk failed after retries");
+        push_toast(
+            toasts,
+            format!("location {from}: chunk failed after retries"),
+            true,
+        );
         return;
-    }
-
-    let rows = match client
-        .get_location(
-            session_key,
-            &[driver],
-            Some(date_start),
-            None,
-            Some(date_end),
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(session_key, driver, error = %e, "bootstrap location fetch failed");
-            push_toast(toasts, format!("location #{driver}: {e}"), true);
-            return;
-        }
     };
     if rows.is_empty() {
         return;
     }
-
     let db = db.lock().unwrap();
     if db.begin().is_ok() {
         if let Err(e) = db.upsert_location(session_key, &rows) {
-            tracing::error!(session_key, driver, error = %e, "bootstrap location upsert failed");
-            push_toast(toasts, format!("location #{driver} upsert: {e}"), true);
+            tracing::error!(session_key, error = %e, "bootstrap location upsert failed");
+            push_toast(toasts, format!("location upsert: {e}"), true);
         }
         let _ = db.commit();
     }
+}
+
+/// Yield `(from, to)` RFC3339 pairs walking `start..end` in `BOOTSTRAP_CHUNK_SECS`
+/// steps. The first chunk's lower bound is exactly `date_start` so we never
+/// issue an open-ended request (OpenF1 has been observed to time out or 422
+/// when the lower bound is omitted).
+fn bootstrap_chunks(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(String, String)> {
+    let chunk = chrono::Duration::seconds(BOOTSTRAP_CHUNK_SECS);
+    let mut out = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let next = (cursor + chunk).min(end);
+        out.push((fmt_ts(cursor), fmt_ts(next)));
+        cursor = next;
+    }
+    out
+}
+
+/// Run `op` up to `attempts` times, returning `Some(value)` on first success.
+/// Backs off 1 s / 2 s / 4 s / … between tries so a brief API hiccup doesn't
+/// permanently leave a hole in a chunk's data.
+async fn fetch_with_retry<T, F, Fut>(attempts: usize, mut op: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    for attempt in 0..attempts {
+        match op().await {
+            Ok(v) => return Some(v),
+            Err(e) if attempt + 1 < attempts => {
+                let backoff = std::time::Duration::from_secs(1u64 << attempt);
+                tracing::warn!(error = %e, attempt = attempt + 1, ?backoff, "bootstrap chunk retry");
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bootstrap chunk gave up after retries");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Lightweight loop for replay sessions.
@@ -444,4 +482,54 @@ pub async fn fetch_endpoint(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_chunks_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn dt(secs_from_epoch: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs_from_epoch, 0).unwrap()
+    }
+
+    #[test]
+    fn splits_full_window_into_15min_chunks() {
+        // 2-hour race → 8 fifteen-minute chunks.
+        let start = dt(0);
+        let end = dt(2 * 60 * 60);
+        let out = bootstrap_chunks(start, end);
+        assert_eq!(out.len(), 8);
+        // First chunk starts at start, last chunk ends at end.
+        assert_eq!(out[0].0, fmt_ts(start));
+        assert_eq!(out[7].1, fmt_ts(end));
+    }
+
+    #[test]
+    fn final_chunk_is_clamped_to_end() {
+        // 20-minute window: one full 15-min chunk then a 5-min tail.
+        let start = dt(0);
+        let end = dt(20 * 60);
+        let out = bootstrap_chunks(start, end);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (fmt_ts(dt(0)), fmt_ts(dt(15 * 60))));
+        assert_eq!(out[1], (fmt_ts(dt(15 * 60)), fmt_ts(dt(20 * 60))));
+    }
+
+    #[test]
+    fn sub_chunk_window_yields_single_chunk() {
+        let start = dt(0);
+        let end = dt(5 * 60);
+        let out = bootstrap_chunks(start, end);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], (fmt_ts(start), fmt_ts(end)));
+    }
+
+    #[test]
+    fn empty_window_yields_no_chunks() {
+        // Defensive: bootstrap should be a no-op when the session has
+        // collapsed bounds. The walk's `cursor < end` guard handles it.
+        let t = dt(0);
+        assert!(bootstrap_chunks(t, t).is_empty());
+    }
 }
